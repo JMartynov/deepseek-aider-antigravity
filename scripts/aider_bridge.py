@@ -11,10 +11,23 @@ import re
 import sys
 import json
 import argparse
+import shutil
 import subprocess
 import urllib.request
 import urllib.error
 from pathlib import Path
+
+
+ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+
+
+def compact_failure_trace(trace: str, max_lines: int = 40) -> str:
+    """Strip ANSI escape codes and return the last max_lines non-empty lines."""
+    if max_lines <= 0:
+        return ""
+    clean = ANSI_ESCAPE_RE.sub("", trace or "")
+    lines = [line.rstrip() for line in clean.splitlines() if line.strip()]
+    return "\n".join(lines[-max_lines:])
 
 
 def fetch_account_balance(api_key: str):
@@ -103,13 +116,15 @@ def extract_questions(output: str):
 
 def check_diff_applied_successfully(output: str):
     """Detect if Aider encountered a search/replace diff failure."""
+    # Strip thinking blocks to avoid matching internal reasoning traces
+    clean_output = re.sub(r"► \*\*THINKING\*\*.*?► \*\*ANSWER\*\*", "", output, flags=re.DOTALL)
     failure_patterns = [
         r"Failed to apply edit to",
         r"The search block did not match",
         r"did not find the search block"
     ]
     for pattern in failure_patterns:
-        if re.search(pattern, output, re.IGNORECASE):
+        if re.search(pattern, clean_output, re.IGNORECASE):
             return False
     return True
 
@@ -138,6 +153,54 @@ def remove_ephemeral_aiderignore(ignore_path: Path):
             ignore_path.unlink()
     except OSError:
         pass
+
+
+def create_task_worktree(task_id: str, cwd: Path, base_branch: str = None) -> tuple[Path, str]:
+    """Create (or reuse) the isolated worktree for a task on branch 'task/<task_id>'."""
+    worktree_path = cwd / ".worktrees" / task_id
+    branch_name = f"task/{task_id}"
+    if worktree_path.exists():
+        print(f"[WORKTREE] Reusing existing worktree: {worktree_path}")
+        return worktree_path, branch_name
+    worktree_path.parent.mkdir(parents=True, exist_ok=True)
+    cmd = ["git", "worktree", "add", "-b", branch_name, str(worktree_path)]
+    if base_branch:
+        cmd.append(base_branch)
+    result = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"Failed to create worktree: {result.stderr.strip()}")
+    print(f"[WORKTREE] Created branch {branch_name} at {worktree_path}")
+    return worktree_path, branch_name
+
+
+def merge_and_remove_worktree(task_id: str, worktree_path: Path, branch_name: str,
+                              cwd: Path, auto_merge: bool = True):
+    """Remove the worktree; if auto_merge, merge its branch then delete it."""
+    remove = subprocess.run(
+        ["git", "worktree", "remove", "--force", str(worktree_path)],
+        cwd=cwd, capture_output=True, text=True
+    )
+    if remove.returncode != 0:
+        print(f"[WORKTREE] Failed to remove worktree: {remove.stderr.strip()}", file=sys.stderr)
+    else:
+        print(f"[WORKTREE] Removed worktree: {worktree_path}")
+    if not auto_merge:
+        return
+    merge = subprocess.run(
+        ["git", "merge", "--no-edit", branch_name],
+        cwd=cwd, capture_output=True, text=True
+    )
+    if merge.returncode != 0:
+        print(f"[WORKTREE] Merge failed: {merge.stderr.strip()}", file=sys.stderr)
+        print("[STATUS] MERGE_FAILED", file=sys.stderr)
+        sys.exit(15)
+    print(f"[WORKTREE] Merged {branch_name} into current branch")
+    delete = subprocess.run(
+        ["git", "branch", "-D", branch_name],
+        cwd=cwd, capture_output=True, text=True
+    )
+    if delete.returncode != 0:
+        print(f"[WORKTREE] Failed to delete branch {branch_name}: {delete.stderr.strip()}", file=sys.stderr)
 
 
 def detect_lint_cmd(files: list[str], user_lint_cmd: str = None):
@@ -178,9 +241,52 @@ def rollback_target_files(files: list[str], cwd: Path):
             print(f"[ROLLBACK] Failed for {f}: {e}", file=sys.stderr)
 
 
+def run_preflight_checks(read_files: list[str], cwd: Path):
+    """Warn on uncommitted git changes; fail (exit 14) if any read-only file is missing."""
+    if (cwd / ".git").exists():
+        try:
+            status = subprocess.run(
+                ["git", "status", "--porcelain"],
+                cwd=cwd, capture_output=True, text=True
+            )
+            if status.returncode == 0 and status.stdout.strip():
+                print("[WARN] Uncommitted git changes detected in working tree.", file=sys.stderr)
+        except Exception as e:
+            print(f"[WARN] Could not check git status: {e}", file=sys.stderr)
+    missing = [f for f in (read_files or []) if not (cwd / f).exists()]
+    if missing:
+        for f in missing:
+            print(f"[ERROR] Read-only reference file missing: {f}", file=sys.stderr)
+        print("[STATUS] PREFLIGHT_FAILED")
+        sys.exit(14)
+
+
 def run_turn(task_id: str, message: str, files: list[str], cwd: Path, 
              read_files: list[str] = None, restore: bool = False, 
-             model: str = "deepseek/deepseek-flash", lint_cmd: str = None):
+             model: str = "deepseek/deepseek-flash", lint_cmd: str = None,
+             worktree: bool = False):
+    if worktree:
+        worktree_path, branch_name = create_task_worktree(task_id, cwd)
+        env_src = cwd / ".env"
+        if env_src.exists():
+            shutil.copy(env_src, worktree_path / ".env")
+        try:
+            run_turn(task_id, message, files, worktree_path,
+                     read_files=read_files, restore=restore, model=model,
+                     lint_cmd=lint_cmd, worktree=False)
+        except SystemExit as e:
+            code = e.code if isinstance(e.code, int) else (0 if e.code is None else 1)
+            if code == 0:
+                merge_and_remove_worktree(task_id, worktree_path, branch_name, cwd)
+            elif code == 10:
+                print(f"[WORKTREE] Kept for resumption: {worktree_path} (branch {branch_name})")
+            else:
+                subprocess.run(
+                    ["git", "worktree", "remove", "--force", str(worktree_path)],
+                    cwd=cwd, capture_output=True, text=True
+                )
+                print(f"[WORKTREE] Removed worktree after failure; branch {branch_name} kept")
+            raise
     # Path containment validation first (security guard)
     for f in (files or []) + (read_files or []):
         resolved = (cwd / f).resolve()
@@ -188,6 +294,7 @@ def run_turn(task_id: str, message: str, files: list[str], cwd: Path,
             print(f"[ERROR] Security violation: path '{f}' is outside project root!", file=sys.stderr)
             sys.exit(12)
             
+    run_preflight_checks(read_files, cwd)
     load_project_env(cwd)
     
     if not os.environ.get("DEEPSEEK_API_KEY"):
@@ -337,21 +444,32 @@ def main():
     turn_parser.add_argument("--restore", action="store_true", help="Restore prior turn session history for prefix cache")
     turn_parser.add_argument("--model", default="deepseek/deepseek-flash", help="Model name (default: deepseek/deepseek-flash)")
     turn_parser.add_argument("--lint-cmd", default=None, help="Custom lint command passed to Aider (enables --auto-lint)")
+    turn_parser.add_argument("--worktree", action="store_true", help="Run the turn inside an isolated git worktree and branch")
     turn_parser.add_argument("--cwd", default=".", help="Project working directory")
     
     clean_parser = subparsers.add_parser("cleanup", help="Clean up session history file")
     clean_parser.add_argument("--task-id", required=True, help="Task identifier to clean up")
     clean_parser.add_argument("--cwd", default=".", help="Project working directory")
+
+    log_parser = subparsers.add_parser("compact-log", help="Strip ANSI codes and print the tail of a log")
+    log_parser.add_argument("--log-file", required=True, help="Path to the log file to compact")
+    log_parser.add_argument("--max-lines", type=int, default=40, help="Trailing non-empty lines to keep (default: 40)")
     
     args = parser.parse_args()
-    cwd_path = Path(args.cwd).resolve()
+    cwd_path = Path(getattr(args, "cwd", ".")).resolve()
     
     if args.command == "turn":
         run_turn(args.task_id, args.message, args.files, cwd_path, 
                  read_files=args.read_files, restore=args.restore, model=args.model,
-                 lint_cmd=args.lint_cmd)
+                 lint_cmd=args.lint_cmd, worktree=args.worktree)
     elif args.command == "cleanup":
         cleanup_session(args.task_id, cwd_path)
+    elif args.command == "compact-log":
+        log_path = Path(args.log_file)
+        if not log_path.exists():
+            print(f"[ERROR] Log file not found: {log_path}", file=sys.stderr)
+            sys.exit(1)
+        print(compact_failure_trace(log_path.read_text(), args.max_lines))
 
 
 if __name__ == "__main__":
