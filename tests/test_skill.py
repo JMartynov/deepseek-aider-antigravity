@@ -28,8 +28,10 @@ def test_parse_cost_and_tokens():
     Tokens: 2.5k sent, 150 received. Cost: $0.00076 message, $0.00076 session.
     Applied edit to factorial.py
     """
-    sent, rcvd, cost_msg, cost_session = aider_bridge.parse_cost_and_tokens(sample_output)
+    sent, write, hit, rcvd, cost_msg, cost_session = aider_bridge.parse_cost_and_tokens(sample_output)
     assert sent == "2.5k"
+    assert write == "0"
+    assert hit == "0"
     assert rcvd == "150"
     assert cost_msg == "0.00076"
     assert cost_session == "0.00076"
