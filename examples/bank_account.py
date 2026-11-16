@@ -13,3 +13,6 @@ class BankAccount:
         if amount > self.balance:
             raise ValueError("Insufficient funds")
         self.balance -= amount
+
+    def get_balance(self):
+        return self.balance

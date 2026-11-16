@@ -8,9 +8,40 @@ and clean-up for Antigravity-driven code generation.
 import os
 import re
 import sys
+import json
 import argparse
 import subprocess
+import urllib.request
+import urllib.error
 from pathlib import Path
+
+
+def fetch_account_balance(api_key: str):
+    """Query official DeepSeek API for remaining account balance and currency."""
+    if not api_key:
+        return None
+    url = "https://api.deepseek.com/user/balance"
+    req = urllib.request.Request(
+        url,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Accept": "application/json"
+        }
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read().decode())
+            if data.get("is_available") and data.get("balance_infos"):
+                info = data["balance_infos"][0]
+                return {
+                    "currency": info.get("currency", "USD"),
+                    "total_balance": info.get("total_balance", "unknown"),
+                    "granted_balance": info.get("granted_balance", "0.00"),
+                    "topped_up_balance": info.get("topped_up_balance", "0.00")
+                }
+    except Exception as e:
+        return {"error": str(e)}
+    return None
 
 def load_project_env(cwd: Path):
     """Load DEEPSEEK_API_KEY from project .env file only."""
@@ -89,7 +120,24 @@ def run_turn(task_id: str, message: str, files: list[str], cwd: Path, restore: b
     print(combined_output)
     
     tokens_sent, tokens_rcvd, cost_msg, cost_session = parse_cost_and_tokens(combined_output)
-    print(f"\n[METRICS] Tokens Sent: {tokens_sent} | Received: {tokens_rcvd} | Cost Message: ${cost_msg} | Cost Session: ${cost_session}")
+    
+    # Query live DeepSeek balance API
+    balance_info = fetch_account_balance(os.environ.get("DEEPSEEK_API_KEY"))
+    balance_str = "N/A"
+    if balance_info:
+        if "error" in balance_info:
+            balance_str = f"Error fetching ({balance_info['error']})"
+        else:
+            balance_str = f"{balance_info['total_balance']} {balance_info['currency']}"
+
+    print("=" * 60)
+    print(f"📊 [CALL METRICS & LIVE BALANCE]")
+    print(f" • Tokens Sent     : {tokens_sent}")
+    print(f" • Tokens Received : {tokens_rcvd}")
+    print(f" • Turn Cost (USD) : ${cost_msg}")
+    print(f" • Session Total   : ${cost_session}")
+    print(f" • Live API Balance: {balance_str}")
+    print("=" * 60)
     
     # Check for QUESTION: stop-word
     question_match = re.search(r"QUESTION:\s*(.+)", combined_output)
