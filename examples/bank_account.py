@@ -15,4 +15,5 @@ class BankAccount:
         self.balance -= amount
 
     def get_balance(self):
+        """Return the current balance (int or float)."""
         return self.balance

@@ -116,7 +116,7 @@ def check_diff_applied_successfully(output: str):
 
 def run_turn(task_id: str, message: str, files: list[str], cwd: Path, 
              read_files: list[str] = None, restore: bool = False, 
-             model: str = "deepseek/deepseek-chat"):
+             model: str = "deepseek/deepseek-flash"):
     # Path containment validation first (security guard)
     for f in (files or []) + (read_files or []):
         resolved = (cwd / f).resolve()
@@ -252,7 +252,7 @@ def main():
     turn_parser.add_argument("--files", nargs="*", default=[], help="Editable target files")
     turn_parser.add_argument("--read-files", nargs="*", default=[], help="Read-only reference files")
     turn_parser.add_argument("--restore", action="store_true", help="Restore prior turn session history for prefix cache")
-    turn_parser.add_argument("--model", default="deepseek/deepseek-chat", help="Model name (default: deepseek/deepseek-chat)")
+    turn_parser.add_argument("--model", default="deepseek/deepseek-flash", help="Model name (default: deepseek/deepseek-flash)")
     turn_parser.add_argument("--cwd", default=".", help="Project working directory")
     
     clean_parser = subparsers.add_parser("cleanup", help="Clean up session history file")

@@ -8,21 +8,25 @@ description: Global token-sparse coding sub-agent using Aider and DeepSeek. Feat
 Use this skill whenever delegating code writing, refactoring, or test generation to a cost-effective, high-intelligence coding model (`deepseek/deepseek-chat`).
 
 ## Core Principles
-1. **Ultra Token-Sparsity**:
-   - Model: `deepseek/deepseek-chat` (cheapest non-reasoning model).
-   - `edit-format: diff`: Only unified search/replace diffs are returned.
-   - `map-tokens: 0`: No repo-map scans to avoid large context bloat.
-   - Prefix Caching: Prompts and session files are structured to hit DeepSeek's server-side prefix cache (~90% cost reduction on subsequent turns).
-2. **Strict Scope Bounding**:
-   - Always restrict the sub-agent to an explicit set of target editable/reference files. Never pass entire repository trees.
+1. **Ultra Token-Sparsity & Flash Architecture**:
+   - Model: `deepseek/deepseek-flash` (DeepSeek V4.1-Flash with 1M context, MoE architecture, and prompt caching).
+   - `edit-format: diff`: Only unified search/replace diffs are returned to minimize output tokens.
+   - `map-tokens: 0`: No repo-map scans to prevent context window bloat and external build issues.
+   - Prefix Caching (`cache-prompts: true` + `cache-keepalive-pings: 6`): DeepSeek hardware caches static system instructions and target files, reducing subsequent turn token costs by ~90–98%.
+2. **Strict Scope Bounding & Reference Protection**:
+   - Target editable files are explicitly passed to `--files`.
+   - Read-only contract/schema files are explicitly passed to `--read-files`, preventing unwanted edits.
+   - Never dump entire repositories into the prompt.
 3. **Secrets Isolation**:
-   - `DEEPSEEK_API_KEY` is loaded exclusively from the target project's `.env` file.
+   - `DEEPSEEK_API_KEY` is loaded strictly from the target project's `.env` file (never hardcoded, ignored by git).
 4. **Interactive Message-Passing & Question Intercept**:
-   - If requirements or signatures are ambiguous, the sub-agent halts and outputs `QUESTION: <question>`.
-   - The runner exits with status `10` (`INTERACTIVE_QUESTION`).
-   - Antigravity intercepts the question, formulates the architectural answer from project context, and re-invokes with `--restore` to continue the session under cache discount.
-5. **Session Cleanup**:
-   - Once the sub-agent finishes and verification tests pass, remove the ephemeral session file using `cleanup`.
+   - If requirements or signatures are ambiguous, the sub-agent halts and outputs `QUESTION: <question>` without modifying code.
+   - The runner intercepts the question, displays it clearly, and exits with status `10` (`INTERACTIVE_QUESTION`).
+   - Antigravity catches exit code 10, formulates an architectural decision, and re-invokes with `--restore` to continue the exact same session under cache discount.
+5. **Live Token, Cost & Balance Telemetry**:
+   - Queries `https://api.deepseek.com/user/balance` after every turn to display real-time account balances alongside turn and session costs.
+6. **Session Cleanup**:
+   - Once tests pass, the ephemeral `.aider.session_<id>.md` is cleaned up immediately via `cleanup`.
 
 ---
 
