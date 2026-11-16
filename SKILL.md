@@ -60,7 +60,8 @@ A high-efficiency coding sub-agent skill designed for the **Antigravity Lead Arc
   - Pass files to be modified via `--files <file1> <file2>`.
   - Pass reference interfaces, schemas, or docs via `--read-files <ref1> <ref2>`. Aider opens these with `--read`, protecting them from unintended edits.
 - **Git Worktree Isolation (`--worktree`)**: Run turns on dedicated temporary worktrees (`.worktrees/<task-id>`) and branches (`task/<task-id>`). Use `--no-auto-merge` for multi-pass workflows (Pass 1 Impl -> Pass 2 Review/Restore -> Tests -> Merge), followed by explicit `merge-worktree --task-id <task-id>` when verification succeeds.
-  - Pass reference interfaces, schemas, or docs via `--read-files <ref1> <ref2>`. Aider opens these with `--read`, protecting them from unintended edits.
+- **Atomic Mutex & Auto-Rebase (`with_git_lock`)**: Merging worktrees automatically locks `.git/aider_merge.lock.d`, checks if the base branch advanced during the turn, and auto-rebases before merging to serialize concurrent sub-agents without index collisions or conflicts.
+- **Worktree PYTHONPATH Isolation**: Test suites executed within an isolated worktree should always prepend `PYTHONPATH="${WORKTREE}/src"`; `run_preflight_checks` automatically exports local `src/` to `PYTHONPATH` if present.
 
 ### 3. Secrets Isolation
 - `DEEPSEEK_API_KEY` is loaded strictly from the target project's `.env` file.

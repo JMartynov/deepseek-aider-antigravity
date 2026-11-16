@@ -45,6 +45,20 @@ def test_preflight_checks_fails_on_missing_read_file():
         assert exc.value.code == 14
 
 
+def test_preflight_checks_injects_pythonpath():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmppath = Path(tmpdir)
+        src_dir = tmppath / "src"
+        src_dir.mkdir()
+        import os
+        old_pp = os.environ.get("PYTHONPATH", "")
+        try:
+            aider_bridge.run_preflight_checks(read_files=[], cwd=tmppath)
+            assert str(src_dir.resolve()) in os.environ.get("PYTHONPATH", "")
+        finally:
+            os.environ["PYTHONPATH"] = old_pp
+
+
 def test_preflight_checks_warns_on_dirty_tree(monkeypatch, capsys):
     with tempfile.TemporaryDirectory() as tmpdir:
         tmppath = Path(tmpdir)
@@ -152,3 +166,57 @@ def test_worktree_staged_multi_pass_and_explicit_merge():
         assert not wt_path2.exists()
         assert (tmppath / "feature.py").exists()
         assert "return 42" in (tmppath / "feature.py").read_text()
+
+
+def test_with_git_lock_mutex_serialization():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmppath = Path(tmpdir)
+        (tmppath / ".git").mkdir()
+
+        # Acquire lock
+        with aider_bridge.with_git_lock(tmppath, timeout=1.0) as lock1:
+            assert lock1.exists()
+
+            # Second concurrent lock should timeout
+            import pytest
+            with pytest.raises(TimeoutError):
+                with aider_bridge.with_git_lock(tmppath, timeout=0.2, retry_interval=0.05):
+                    pass
+
+        # After exiting, lock must be released
+        assert not lock1.exists()
+
+
+def test_auto_rebase_on_advancing_base_branch():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmppath = Path(tmpdir)
+        # Initialize repo with main branch
+        subprocess.run(["git", "init", "-b", "main"], cwd=tmppath, check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.name", "TestUser"], cwd=tmppath, check=True)
+        subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=tmppath, check=True)
+        (tmppath / "base.txt").write_text("v1\n")
+        subprocess.run(["git", "add", "."], cwd=tmppath, check=True)
+        subprocess.run(["git", "commit", "-m", "Base v1"], cwd=tmppath, check=True)
+
+        # Worker A: create task/a branch and worktree
+        wt_a, branch_a = aider_bridge.create_task_worktree("task_a", tmppath)
+        (wt_a / "feature_a.py").write_text("def a(): pass\n")
+        subprocess.run(["git", "add", "."], cwd=wt_a, check=True)
+        subprocess.run(["git", "commit", "-m", "Commit in Task A"], cwd=wt_a, check=True)
+
+        # Main advances (e.g. Worker B landed first)
+        (tmppath / "base.txt").write_text("v2 advanced\n")
+        subprocess.run(["git", "add", "."], cwd=tmppath, check=True)
+        subprocess.run(["git", "commit", "-m", "Base advanced to v2"], cwd=tmppath, check=True)
+
+        # Now Worker A merges using merge_worktree_task (which auto-rebases under mutex)
+        aider_bridge.merge_worktree_task("task_a", tmppath)
+
+        assert not wt_a.exists()
+        assert (tmppath / "feature_a.py").exists()
+        assert (tmppath / "base.txt").read_text() == "v2 advanced\n"
+
+        # Check linear log history
+        log_res = subprocess.run(["git", "log", "--oneline"], cwd=tmppath, capture_output=True, text=True)
+        assert "Commit in Task A" in log_res.stdout
+        assert "Base advanced to v2" in log_res.stdout

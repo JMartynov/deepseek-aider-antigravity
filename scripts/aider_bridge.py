@@ -9,6 +9,7 @@ and session cleanup for Antigravity-driven code generation.
 import os
 import re
 import sys
+import time
 import json
 import argparse
 import shutil
@@ -16,6 +17,7 @@ import subprocess
 import urllib.request
 import urllib.error
 from pathlib import Path
+from contextlib import contextmanager
 
 
 ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
@@ -177,6 +179,86 @@ def create_ephemeral_model_settings(cwd: Path, model: str):
     return settings_path
 
 
+@contextmanager
+def with_git_lock(cwd: Path, timeout: float = 60.0, retry_interval: float = 0.5):
+    """
+    Acquire an atomic directory lock (.git/aider_merge.lock.d) to serialize
+    git worktree merges across concurrent sub-agents without index.lock collisions.
+    """
+    git_dir = cwd / ".git"
+    if git_dir.is_file():
+        # Inside a worktree, .git is a file pointing to gitdir: ...
+        try:
+            content = git_dir.read_text().strip()
+            if content.startswith("gitdir:"):
+                git_dir = Path(content.split("gitdir:", 1)[1].strip()).resolve()
+                if "worktrees" in str(git_dir):
+                    # Traverse up to common .git root
+                    git_dir = git_dir.parent.parent
+        except Exception:
+            git_dir = cwd / ".git"
+
+    lock_dir = git_dir / "aider_merge.lock.d" if git_dir.exists() else cwd / ".aider_merge.lock.d"
+    start_time = time.time()
+    acquired = False
+
+    while not acquired:
+        try:
+            lock_dir.mkdir(parents=True, exist_ok=False)
+            acquired = True
+            print(f"[MUTEX] Acquired git merge lock: {lock_dir.name}")
+        except FileExistsError:
+            if time.time() - start_time >= timeout:
+                raise TimeoutError(f"Timed out waiting {timeout}s for git merge lock: {lock_dir}")
+            time.sleep(retry_interval)
+
+    try:
+        yield lock_dir
+    finally:
+        try:
+            if lock_dir.exists():
+                lock_dir.rmdir()
+                print(f"[MUTEX] Released git merge lock: {lock_dir.name}")
+        except Exception as e:
+            print(f"[MUTEX] Error releasing git merge lock: {e}", file=sys.stderr)
+
+
+def auto_rebase_branch_if_needed(branch_name: str, cwd: Path, base_branch: str = "main"):
+    """
+    Check if base branch has advanced ahead of task branch. If so, rebase task
+    branch onto the updated base branch to maintain clean linear history.
+    """
+    # Detect current base branch if not provided
+    head_check = subprocess.run(
+        ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+        cwd=cwd, capture_output=True, text=True
+    )
+    current_head = head_check.stdout.strip() if head_check.returncode == 0 else base_branch
+    target_base = current_head if current_head and current_head != "HEAD" else base_branch
+
+    # Find merge base between base branch and task branch
+    merge_base = subprocess.run(
+        ["git", "merge-base", target_base, branch_name],
+        cwd=cwd, capture_output=True, text=True
+    )
+    base_rev = subprocess.run(
+        ["git", "rev-parse", target_base],
+        cwd=cwd, capture_output=True, text=True
+    )
+    if merge_base.returncode == 0 and base_rev.returncode == 0:
+        if merge_base.stdout.strip() != base_rev.stdout.strip():
+            print(f"[REBASE] Base branch {target_base} has advanced. Rebasing {branch_name} onto {target_base}...")
+            rebase = subprocess.run(
+                ["git", "rebase", target_base, branch_name],
+                cwd=cwd, capture_output=True, text=True
+            )
+            if rebase.returncode != 0:
+                print(f"[REBASE] Warning: Auto-rebase failed: {rebase.stderr.strip()}", file=sys.stderr)
+                subprocess.run(["git", "rebase", "--abort"], cwd=cwd, capture_output=True)
+            else:
+                print(f"[REBASE] Successfully rebased {branch_name} onto {target_base}")
+
+
 def create_task_worktree(task_id: str, cwd: Path, base_branch: str = None) -> tuple[Path, str]:
     """Create (or reuse) the isolated worktree for a task on branch 'task/<task_id>'."""
     worktree_path = cwd / ".worktrees" / task_id
@@ -205,7 +287,7 @@ def create_task_worktree(task_id: str, cwd: Path, base_branch: str = None) -> tu
 
 def merge_and_remove_worktree(task_id: str, worktree_path: Path, branch_name: str,
                               cwd: Path, auto_merge: bool = True):
-    """Remove the worktree; if auto_merge, merge its branch then delete it."""
+    """Remove the worktree; if auto_merge, lock git, rebase if needed, merge, then delete branch."""
     remove = subprocess.run(
         ["git", "worktree", "remove", "--force", str(worktree_path)],
         cwd=cwd, capture_output=True, text=True
@@ -216,25 +298,28 @@ def merge_and_remove_worktree(task_id: str, worktree_path: Path, branch_name: st
         print(f"[WORKTREE] Removed worktree: {worktree_path}")
     if not auto_merge:
         return
-    merge = subprocess.run(
-        ["git", "merge", "--no-edit", branch_name],
-        cwd=cwd, capture_output=True, text=True
-    )
-    if merge.returncode != 0:
-        print(f"[WORKTREE] Merge failed: {merge.stderr.strip()}", file=sys.stderr)
-        print("[STATUS] MERGE_FAILED", file=sys.stderr)
-        sys.exit(15)
-    print(f"[WORKTREE] Merged {branch_name} into current branch")
-    delete = subprocess.run(
-        ["git", "branch", "-D", branch_name],
-        cwd=cwd, capture_output=True, text=True
-    )
-    if delete.returncode != 0:
-        print(f"[WORKTREE] Failed to delete branch {branch_name}: {delete.stderr.strip()}", file=sys.stderr)
+
+    with with_git_lock(cwd):
+        auto_rebase_branch_if_needed(branch_name, cwd)
+        merge = subprocess.run(
+            ["git", "merge", "--no-edit", branch_name],
+            cwd=cwd, capture_output=True, text=True
+        )
+        if merge.returncode != 0:
+            print(f"[WORKTREE] Merge failed: {merge.stderr.strip()}", file=sys.stderr)
+            print("[STATUS] MERGE_FAILED", file=sys.stderr)
+            sys.exit(15)
+        print(f"[WORKTREE] Merged {branch_name} into current branch")
+        delete = subprocess.run(
+            ["git", "branch", "-D", branch_name],
+            cwd=cwd, capture_output=True, text=True
+        )
+        if delete.returncode != 0:
+            print(f"[WORKTREE] Failed to delete branch {branch_name}: {delete.stderr.strip()}", file=sys.stderr)
 
 
 def merge_worktree_task(task_id: str, cwd: Path):
-    """Explicitly merge and cleanup an isolated task worktree."""
+    """Explicitly merge and cleanup an isolated task worktree under mutex protection."""
     worktree_path = cwd / ".worktrees" / task_id
     branch_name = f"task/{task_id}"
     if worktree_path.exists():
@@ -242,19 +327,21 @@ def merge_worktree_task(task_id: str, cwd: Path):
             ["git", "worktree", "remove", "--force", str(worktree_path)],
             cwd=cwd, capture_output=True, text=True
         )
-    merge = subprocess.run(
-        ["git", "merge", "--no-edit", branch_name],
-        cwd=cwd, capture_output=True, text=True
-    )
-    if merge.returncode != 0:
-        print(f"[ERROR] Merge failed: {merge.stderr.strip()}", file=sys.stderr)
-        sys.exit(15)
-    print(f"[WORKTREE] Successfully merged {branch_name} into current branch")
-    subprocess.run(
-        ["git", "branch", "-D", branch_name],
-        cwd=cwd, capture_output=True, text=True
-    )
-    print(f"[WORKTREE] Deleted branch {branch_name}")
+    with with_git_lock(cwd):
+        auto_rebase_branch_if_needed(branch_name, cwd)
+        merge = subprocess.run(
+            ["git", "merge", "--no-edit", branch_name],
+            cwd=cwd, capture_output=True, text=True
+        )
+        if merge.returncode != 0:
+            print(f"[ERROR] Merge failed: {merge.stderr.strip()}", file=sys.stderr)
+            sys.exit(15)
+        print(f"[WORKTREE] Successfully merged {branch_name} into current branch")
+        subprocess.run(
+            ["git", "branch", "-D", branch_name],
+            cwd=cwd, capture_output=True, text=True
+        )
+        print(f"[WORKTREE] Deleted branch {branch_name}")
 
 
 def detect_lint_cmd(files: list[str], user_lint_cmd: str = None):
@@ -296,7 +383,18 @@ def rollback_target_files(files: list[str], cwd: Path):
 
 
 def run_preflight_checks(read_files: list[str], cwd: Path):
-    """Warn on uncommitted git changes; fail (exit 14) if any read-only file is missing."""
+    """
+    Warn on uncommitted git changes; fail (exit 14) if any read-only file is missing.
+    Automatically ensures cwd / src is exported to PYTHONPATH if it exists.
+    """
+    src_dir = cwd / "src"
+    if src_dir.is_dir():
+        current_pp = os.environ.get("PYTHONPATH", "")
+        src_str = str(src_dir.resolve())
+        if src_str not in current_pp.split(os.pathsep):
+            os.environ["PYTHONPATH"] = f"{src_str}{os.pathsep}{current_pp}".rstrip(os.pathsep)
+            print(f"[PREFLIGHT] Injected PYTHONPATH: {src_str}")
+
     if (cwd / ".git").exists():
         try:
             status = subprocess.run(
