@@ -114,9 +114,73 @@ def check_diff_applied_successfully(output: str):
     return True
 
 
+def create_ephemeral_aiderignore(cwd: Path):
+    """Create an ephemeral .aiderignore shield covering secrets and cache artifacts."""
+    ignore_path = cwd / ".aiderignore.ephemeral"
+    patterns = [
+        ".env*",
+        "*.pem",
+        "*.key",
+        "__pycache__/",
+        "*.pyc",
+        ".pytest_cache/",
+        ".cache/",
+        "node_modules/",
+    ]
+    ignore_path.write_text("\n".join(patterns) + "\n")
+    return ignore_path
+
+
+def remove_ephemeral_aiderignore(ignore_path: Path):
+    """Delete the ephemeral .aiderignore file, ignoring cleanup errors."""
+    try:
+        if ignore_path and ignore_path.exists():
+            ignore_path.unlink()
+    except OSError:
+        pass
+
+
+def detect_lint_cmd(files: list[str], user_lint_cmd: str = None):
+    """Resolve the Aider lint command; fall back to py_compile for Python targets."""
+    if user_lint_cmd:
+        return user_lint_cmd
+    if not any(str(f).endswith(".py") for f in (files or [])):
+        return None
+    try:
+        import importlib.util as _ilu
+        if _ilu.find_spec("py_compile") is None:
+            return None
+    except Exception:
+        return None
+    return "python:python -m py_compile"
+
+
+def rollback_target_files(files: list[str], cwd: Path):
+    """Roll back target files inside a git repo: restore tracked, delete untracked."""
+    if not (cwd / ".git").exists():
+        return
+    for f in (files or []):
+        try:
+            tracked = subprocess.run(
+                ["git", "ls-files", "--error-unmatch", f],
+                cwd=cwd, capture_output=True, text=True
+            )
+            if tracked.returncode == 0:
+                subprocess.run(
+                    ["git", "checkout", "--", f],
+                    cwd=cwd, capture_output=True, text=True
+                )
+                print(f"[ROLLBACK] Restored tracked file: {f}")
+            elif (cwd / f).exists():
+                (cwd / f).unlink()
+                print(f"[ROLLBACK] Deleted untracked file: {f}")
+        except Exception as e:
+            print(f"[ROLLBACK] Failed for {f}: {e}", file=sys.stderr)
+
+
 def run_turn(task_id: str, message: str, files: list[str], cwd: Path, 
              read_files: list[str] = None, restore: bool = False, 
-             model: str = "deepseek/deepseek-flash"):
+             model: str = "deepseek/deepseek-flash", lint_cmd: str = None):
     # Path containment validation first (security guard)
     for f in (files or []) + (read_files or []):
         resolved = (cwd / f).resolve()
@@ -162,6 +226,15 @@ def run_turn(task_id: str, message: str, files: list[str], cwd: Path,
         "--no-auto-commits",
         "--message", full_message
     ]
+
+    # Dynamic .aiderignore shield for secrets and cache artifacts
+    ignore_path = create_ephemeral_aiderignore(cwd)
+    cmd.extend(["--aiderignore", str(ignore_path)])
+
+    # Auto-lint / syntax check support
+    resolved_lint_cmd = detect_lint_cmd(files, lint_cmd)
+    if resolved_lint_cmd:
+        cmd.extend(["--auto-lint", "--lint-cmd", resolved_lint_cmd])
     
     # Fallback if no git repo
     if not (cwd / ".git").exists():
@@ -179,12 +252,20 @@ def run_turn(task_id: str, message: str, files: list[str], cwd: Path,
         cmd.append(f)
         
     print(f"--- Running Aider Turn [Task: {task_id}] (restore={restore}) ---")
-    proc = subprocess.run(
-        cmd,
-        cwd=cwd,
-        capture_output=True,
-        text=True
-    )
+    try:
+        proc = subprocess.run(
+            cmd,
+            cwd=cwd,
+            capture_output=True,
+            text=True
+        )
+    except Exception as e:
+        rollback_target_files(files, cwd)
+        print(f"[ERROR] Aider invocation failed: {e}", file=sys.stderr)
+        print("[STATUS] AIDER_INVOCATION_FAILED")
+        sys.exit(13)
+    finally:
+        remove_ephemeral_aiderignore(ignore_path)
     
     combined_output = proc.stdout + "\n" + proc.stderr
     print(combined_output)
@@ -221,11 +302,13 @@ def run_turn(task_id: str, message: str, files: list[str], cwd: Path,
         
     # Check if diff failed to apply
     if not check_diff_applied_successfully(combined_output):
+        rollback_target_files(files, cwd)
         print("[ERROR] Sub-agent search/replace edit failed to apply cleanly to disk!", file=sys.stderr)
         print("[STATUS] DIFF_APPLY_FAILED")
         sys.exit(11)
         
     if proc.returncode != 0:
+        rollback_target_files(files, cwd)
         print(f"[ERROR] Aider exited with code {proc.returncode}", file=sys.stderr)
         sys.exit(proc.returncode)
         
@@ -253,6 +336,7 @@ def main():
     turn_parser.add_argument("--read-files", nargs="*", default=[], help="Read-only reference files")
     turn_parser.add_argument("--restore", action="store_true", help="Restore prior turn session history for prefix cache")
     turn_parser.add_argument("--model", default="deepseek/deepseek-flash", help="Model name (default: deepseek/deepseek-flash)")
+    turn_parser.add_argument("--lint-cmd", default=None, help="Custom lint command passed to Aider (enables --auto-lint)")
     turn_parser.add_argument("--cwd", default=".", help="Project working directory")
     
     clean_parser = subparsers.add_parser("cleanup", help="Clean up session history file")
@@ -264,7 +348,8 @@ def main():
     
     if args.command == "turn":
         run_turn(args.task_id, args.message, args.files, cwd_path, 
-                 read_files=args.read_files, restore=args.restore, model=args.model)
+                 read_files=args.read_files, restore=args.restore, model=args.model,
+                 lint_cmd=args.lint_cmd)
     elif args.command == "cleanup":
         cleanup_session(args.task_id, cwd_path)
 
