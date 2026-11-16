@@ -1,4 +1,6 @@
-# DeepSeek + Aider Antigravity Interactive Sub-Agent Demo
+# DeepSeek + Aider Antigravity Interactive Sub-Agent
+
+Repository: [https://github.com/JMartynov/deepseek-aider-antigravity](https://github.com/JMartynov/deepseek-aider-antigravity)
 
 This repository demonstrates the end-to-end interactive workflow between **Google Antigravity** (acting as Lead Architect) and **DeepSeek V3** (invoked as an ultra-cheap coding sub-agent via Aider).
 
