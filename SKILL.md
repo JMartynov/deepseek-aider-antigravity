@@ -52,12 +52,14 @@ A high-efficiency coding sub-agent skill designed for the **Antigravity Lead Arc
 - **Default Engine**: `deepseek/deepseek-flash` (DeepSeek V4.1-Flash). It offers state-of-the-art coding abilities with 1M context at ~$0.15/1M input and ~$0.60/1M output, and down to ~$0.003–$0.014/1M on cached tokens.
 - **Diff Edit Format (`edit-format: diff`)**: Forces the model to emit only search/replace blocks. Never let models reprint full 500-line files.
 - **Map Tokens Disabled (`map-tokens: 0`)**: Disabling Aider's AST repo-map avoids token bloat, prevents large cross-file scans, and avoids platform-dependent native compiler prompts.
-- **Prefix Caching (`cache-prompts: true` + `cache-keepalive-pings: 6`)**: DeepSeek hardware caches identical prompt prefixes. When resuming sessions with `--restore`, unchanged system instructions and file context are served from cache at a ~90% discount.
+- **Prefix Caching (`cache-prompts: true` + `cache-keepalive-pings: 6`)**: DeepSeek hardware caches identical prompt prefixes. The bridge automatically supplies an ephemeral model settings file for `deepseek/deepseek-flash` ensuring `caches_by_default: true` and `edit_format: diff`. When resuming sessions with `--restore`, unchanged system instructions and file context are served from cache at a ~90% discount.
 
 ### 2. Strict Scope Bounding & Reference Safety
 - **Pass explicit target files only**: Never pass broad glob patterns (e.g. `src/**/*.py`).
 - **Editable vs Read-Only Segregation**:
   - Pass files to be modified via `--files <file1> <file2>`.
+  - Pass reference interfaces, schemas, or docs via `--read-files <ref1> <ref2>`. Aider opens these with `--read`, protecting them from unintended edits.
+- **Git Worktree Isolation (`--worktree`)**: Run turns on dedicated temporary worktrees (`.worktrees/<task-id>`) and branches (`task/<task-id>`). Use `--no-auto-merge` for multi-pass workflows (Pass 1 Impl -> Pass 2 Review/Restore -> Tests -> Merge), followed by explicit `merge-worktree --task-id <task-id>` when verification succeeds.
   - Pass reference interfaces, schemas, or docs via `--read-files <ref1> <ref2>`. Aider opens these with `--read`, protecting them from unintended edits.
 
 ### 3. Secrets Isolation
@@ -126,3 +128,5 @@ python3 ~/.gemini/config/skills/aider-deepseek/scripts/aider_bridge.py cleanup \
 | `11` | `DIFF_APPLY_FAILED` | Aider search block did not match. Target files automatically rolled back. |
 | `12` | `PATH_TRAVERSAL_VIOLATION` | Target file path resolves outside project root. |
 | `13` | `AIDER_INVOCATION_FAILED` | Process error during launch. Target files automatically rolled back. |
+| `14` | `PREFLIGHT_FAILED` | Missing read-only reference file before starting Aider turn. |
+| `15` | `MERGE_FAILED` | Worktree branch failed to cleanly merge into base branch. |

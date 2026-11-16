@@ -93,3 +93,62 @@ def test_worktree_creation_idempotency_and_cleanup():
         aider_bridge.merge_and_remove_worktree("unit_test_wt", wt_path, branch, tmppath, auto_merge=True)
         assert not wt_path.exists()
         assert (tmppath / "worktree_file.py").exists()
+
+
+def test_ephemeral_model_settings_creation_and_cleanup():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmppath = Path(tmpdir)
+        settings_path = aider_bridge.create_ephemeral_model_settings(tmppath, "deepseek/deepseek-flash")
+        assert settings_path is not None
+        assert settings_path.exists()
+        content = settings_path.read_text()
+        assert "name: deepseek/deepseek-flash" in content
+        assert "caches_by_default: true" in content
+        assert "edit_format: diff" in content
+        
+        # Test non-deepseek model returns None
+        none_settings = aider_bridge.create_ephemeral_model_settings(tmppath, "gpt-4o")
+        assert none_settings is None
+
+        # Test cleanup
+        aider_bridge.remove_ephemeral_file(settings_path)
+        assert not settings_path.exists()
+
+
+def test_worktree_staged_multi_pass_and_explicit_merge():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmppath = Path(tmpdir)
+        # Initialize repo
+        subprocess.run(["git", "init"], cwd=tmppath, check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.name", "TestUser"], cwd=tmppath, check=True)
+        subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=tmppath, check=True)
+        (tmppath / "base.txt").write_text("initial base content\n")
+        subprocess.run(["git", "add", "."], cwd=tmppath, check=True)
+        subprocess.run(["git", "commit", "-m", "Initial commit"], cwd=tmppath, check=True)
+
+        task_id = "staged_task_42"
+        wt_path, branch = aider_bridge.create_task_worktree(task_id, tmppath)
+        assert wt_path.exists()
+
+        # Pass 1 inside worktree
+        (wt_path / "feature.py").write_text("def feature(): return 1\n")
+        subprocess.run(["git", "add", "feature.py"], cwd=wt_path, check=True)
+        subprocess.run(["git", "commit", "-m", "Pass 1 implementation"], cwd=wt_path, check=True)
+
+        # Worktree kept without auto_merge
+        aider_bridge.merge_and_remove_worktree(task_id, wt_path, branch, tmppath, auto_merge=False)
+        assert not (tmppath / "feature.py").exists() # Not on main yet!
+
+        # Re-create/reuse for Pass 2 (review & polish)
+        wt_path2, branch2 = aider_bridge.create_task_worktree(task_id, tmppath)
+        assert wt_path2.exists()
+        (wt_path2 / "feature.py").write_text("def feature(): return 42\n")
+        subprocess.run(["git", "add", "feature.py"], cwd=wt_path2, check=True)
+        subprocess.run(["git", "commit", "-m", "Pass 2 review refinement"], cwd=wt_path2, check=True)
+
+        # Orchestrator runs explicit merge_worktree_task
+        aider_bridge.merge_worktree_task(task_id, tmppath)
+
+        assert not wt_path2.exists()
+        assert (tmppath / "feature.py").exists()
+        assert "return 42" in (tmppath / "feature.py").read_text()

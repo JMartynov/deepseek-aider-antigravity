@@ -146,13 +146,35 @@ def create_ephemeral_aiderignore(cwd: Path):
     return ignore_path
 
 
-def remove_ephemeral_aiderignore(ignore_path: Path):
-    """Delete the ephemeral .aiderignore file, ignoring cleanup errors."""
+def remove_ephemeral_file(file_path: Path):
+    """Delete an ephemeral file, ignoring cleanup errors."""
     try:
-        if ignore_path and ignore_path.exists():
-            ignore_path.unlink()
+        if file_path and file_path.exists():
+            file_path.unlink()
     except OSError:
         pass
+
+
+def remove_ephemeral_aiderignore(ignore_path: Path):
+    """Delete the ephemeral .aiderignore file, ignoring cleanup errors."""
+    remove_ephemeral_file(ignore_path)
+
+
+def create_ephemeral_model_settings(cwd: Path, model: str):
+    """
+    Ensure deepseek models (e.g. deepseek/deepseek-flash) have explicit
+    caches_by_default=True and edit_format=diff configured in Aider settings.
+    """
+    if not ("deepseek" in model.lower()):
+        return None
+    settings_path = cwd / f".aider.model.settings.{os.getpid()}.yml"
+    settings_yaml = (
+        f"- name: {model}\n"
+        f"  edit_format: diff\n"
+        f"  caches_by_default: true\n"
+    )
+    settings_path.write_text(settings_yaml)
+    return settings_path
 
 
 def create_task_worktree(task_id: str, cwd: Path, base_branch: str = None) -> tuple[Path, str]:
@@ -163,13 +185,21 @@ def create_task_worktree(task_id: str, cwd: Path, base_branch: str = None) -> tu
         print(f"[WORKTREE] Reusing existing worktree: {worktree_path}")
         return worktree_path, branch_name
     worktree_path.parent.mkdir(parents=True, exist_ok=True)
-    cmd = ["git", "worktree", "add", "-b", branch_name, str(worktree_path)]
-    if base_branch:
-        cmd.append(base_branch)
+    # Check if branch already exists
+    branch_check = subprocess.run(
+        ["git", "show-ref", "--verify", "--quiet", f"refs/heads/{branch_name}"],
+        cwd=cwd
+    )
+    if branch_check.returncode == 0:
+        cmd = ["git", "worktree", "add", str(worktree_path), branch_name]
+    else:
+        cmd = ["git", "worktree", "add", "-b", branch_name, str(worktree_path)]
+        if base_branch:
+            cmd.append(base_branch)
     result = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
     if result.returncode != 0:
         raise RuntimeError(f"Failed to create worktree: {result.stderr.strip()}")
-    print(f"[WORKTREE] Created branch {branch_name} at {worktree_path}")
+    print(f"[WORKTREE] Attached branch {branch_name} at {worktree_path}")
     return worktree_path, branch_name
 
 
@@ -201,6 +231,30 @@ def merge_and_remove_worktree(task_id: str, worktree_path: Path, branch_name: st
     )
     if delete.returncode != 0:
         print(f"[WORKTREE] Failed to delete branch {branch_name}: {delete.stderr.strip()}", file=sys.stderr)
+
+
+def merge_worktree_task(task_id: str, cwd: Path):
+    """Explicitly merge and cleanup an isolated task worktree."""
+    worktree_path = cwd / ".worktrees" / task_id
+    branch_name = f"task/{task_id}"
+    if worktree_path.exists():
+        subprocess.run(
+            ["git", "worktree", "remove", "--force", str(worktree_path)],
+            cwd=cwd, capture_output=True, text=True
+        )
+    merge = subprocess.run(
+        ["git", "merge", "--no-edit", branch_name],
+        cwd=cwd, capture_output=True, text=True
+    )
+    if merge.returncode != 0:
+        print(f"[ERROR] Merge failed: {merge.stderr.strip()}", file=sys.stderr)
+        sys.exit(15)
+    print(f"[WORKTREE] Successfully merged {branch_name} into current branch")
+    subprocess.run(
+        ["git", "branch", "-D", branch_name],
+        cwd=cwd, capture_output=True, text=True
+    )
+    print(f"[WORKTREE] Deleted branch {branch_name}")
 
 
 def detect_lint_cmd(files: list[str], user_lint_cmd: str = None):
@@ -264,7 +318,7 @@ def run_preflight_checks(read_files: list[str], cwd: Path):
 def run_turn(task_id: str, message: str, files: list[str], cwd: Path, 
              read_files: list[str] = None, restore: bool = False, 
              model: str = "deepseek/deepseek-flash", lint_cmd: str = None,
-             worktree: bool = False):
+             worktree: bool = False, auto_merge: bool = True):
     if worktree:
         worktree_path, branch_name = create_task_worktree(task_id, cwd)
         env_src = cwd / ".env"
@@ -277,7 +331,10 @@ def run_turn(task_id: str, message: str, files: list[str], cwd: Path,
         except SystemExit as e:
             code = e.code if isinstance(e.code, int) else (0 if e.code is None else 1)
             if code == 0:
-                merge_and_remove_worktree(task_id, worktree_path, branch_name, cwd)
+                if auto_merge:
+                    merge_and_remove_worktree(task_id, worktree_path, branch_name, cwd)
+                else:
+                    print(f"[WORKTREE] Turn passed. Kept worktree without merging: {worktree_path} (branch {branch_name})")
             elif code == 10:
                 print(f"[WORKTREE] Kept for resumption: {worktree_path} (branch {branch_name})")
             else:
@@ -338,6 +395,11 @@ def run_turn(task_id: str, message: str, files: list[str], cwd: Path,
     ignore_path = create_ephemeral_aiderignore(cwd)
     cmd.extend(["--aiderignore", str(ignore_path)])
 
+    # Ephemeral model settings for explicit prompt caching and diff format
+    model_settings_path = create_ephemeral_model_settings(cwd, model)
+    if model_settings_path:
+        cmd.extend(["--model-settings-file", str(model_settings_path)])
+
     # Auto-lint / syntax check support
     resolved_lint_cmd = detect_lint_cmd(files, lint_cmd)
     if resolved_lint_cmd:
@@ -373,6 +435,7 @@ def run_turn(task_id: str, message: str, files: list[str], cwd: Path,
         sys.exit(13)
     finally:
         remove_ephemeral_aiderignore(ignore_path)
+        remove_ephemeral_file(model_settings_path)
     
     combined_output = proc.stdout + "\n" + proc.stderr
     print(combined_output)
@@ -445,11 +508,16 @@ def main():
     turn_parser.add_argument("--model", default="deepseek/deepseek-flash", help="Model name (default: deepseek/deepseek-flash)")
     turn_parser.add_argument("--lint-cmd", default=None, help="Custom lint command passed to Aider (enables --auto-lint)")
     turn_parser.add_argument("--worktree", action="store_true", help="Run the turn inside an isolated git worktree and branch")
+    turn_parser.add_argument("--no-auto-merge", action="store_true", help="Do not auto-merge the worktree on turn completion")
     turn_parser.add_argument("--cwd", default=".", help="Project working directory")
     
     clean_parser = subparsers.add_parser("cleanup", help="Clean up session history file")
     clean_parser.add_argument("--task-id", required=True, help="Task identifier to clean up")
     clean_parser.add_argument("--cwd", default=".", help="Project working directory")
+
+    merge_parser = subparsers.add_parser("merge-worktree", help="Merge isolated task worktree branch and clean up worktree")
+    merge_parser.add_argument("--task-id", required=True, help="Task identifier whose worktree should be merged")
+    merge_parser.add_argument("--cwd", default=".", help="Project working directory")
 
     log_parser = subparsers.add_parser("compact-log", help="Strip ANSI codes and print the tail of a log")
     log_parser.add_argument("--log-file", required=True, help="Path to the log file to compact")
@@ -461,9 +529,12 @@ def main():
     if args.command == "turn":
         run_turn(args.task_id, args.message, args.files, cwd_path, 
                  read_files=args.read_files, restore=args.restore, model=args.model,
-                 lint_cmd=args.lint_cmd, worktree=args.worktree)
+                 lint_cmd=args.lint_cmd, worktree=args.worktree,
+                 auto_merge=not args.no_auto_merge)
     elif args.command == "cleanup":
         cleanup_session(args.task_id, cwd_path)
+    elif args.command == "merge-worktree":
+        merge_worktree_task(args.task_id, cwd_path)
     elif args.command == "compact-log":
         log_path = Path(args.log_file)
         if not log_path.exists():
