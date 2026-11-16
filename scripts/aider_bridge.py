@@ -21,6 +21,36 @@ from contextlib import contextmanager
 
 
 ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+THINKING_BLOCK_RE = re.compile(r"► \*\*THINKING\*\*.*?► \*\*ANSWER\*\*", re.DOTALL)
+
+
+def strip_thinking_block(text: str) -> str:
+    """Strip internal chain-of-thought blocks to preserve orchestrator context tokens."""
+    return THINKING_BLOCK_RE.sub("", text or "").strip()
+
+
+def filter_turn_output(output: str, verbose: bool = False) -> str:
+    """
+    Remove noisy startup banners, dumb terminal notices, and internal thinking traces
+    to minimize orchestrator token consumption while preserving surgical diffs, questions,
+    and metrics.
+    """
+    if verbose:
+        return output
+    clean = strip_thinking_block(output)
+    filtered_lines = []
+    ignore_prefixes = (
+        "Detected dumb terminal",
+        "Cost estimates may be inaccurate",
+        "Scraping https://",
+        "Aider v",
+    )
+    for line in clean.splitlines():
+        trimmed = line.strip()
+        if any(trimmed.startswith(prefix) for prefix in ignore_prefixes):
+            continue
+        filtered_lines.append(line)
+    return "\n".join(filtered_lines).strip()
 
 
 def compact_failure_trace(trace: str, max_lines: int = 40) -> str:
@@ -416,7 +446,8 @@ def run_preflight_checks(read_files: list[str], cwd: Path):
 def run_turn(task_id: str, message: str, files: list[str], cwd: Path, 
              read_files: list[str] = None, restore: bool = False, 
              model: str = "deepseek/deepseek-flash", lint_cmd: str = None,
-             worktree: bool = False, auto_merge: bool = True):
+             worktree: bool = False, auto_merge: bool = True,
+             verbose: bool = False):
     if worktree:
         worktree_path, branch_name = create_task_worktree(task_id, cwd)
         env_src = cwd / ".env"
@@ -425,7 +456,7 @@ def run_turn(task_id: str, message: str, files: list[str], cwd: Path,
         try:
             run_turn(task_id, message, files, worktree_path,
                      read_files=read_files, restore=restore, model=model,
-                     lint_cmd=lint_cmd, worktree=False)
+                     lint_cmd=lint_cmd, worktree=False, verbose=verbose)
         except SystemExit as e:
             code = e.code if isinstance(e.code, int) else (0 if e.code is None else 1)
             if code == 0:
@@ -482,6 +513,7 @@ def run_turn(task_id: str, message: str, files: list[str], cwd: Path,
         "--no-analytics",
         "--no-check-update",
         "--no-show-release-notes",
+        "--no-detect-urls",
         "--no-gitignore",
         "--chat-history-file", str(session_file),
         "--yes-always",
@@ -536,7 +568,7 @@ def run_turn(task_id: str, message: str, files: list[str], cwd: Path,
         remove_ephemeral_file(model_settings_path)
     
     combined_output = proc.stdout + "\n" + proc.stderr
-    print(combined_output)
+    print(filter_turn_output(combined_output, verbose=verbose))
     
     tokens_sent, cache_write, cache_hit, tokens_rcvd, cost_msg, cost_session = parse_cost_and_tokens(combined_output)
     
@@ -607,6 +639,7 @@ def main():
     turn_parser.add_argument("--lint-cmd", default=None, help="Custom lint command passed to Aider (enables --auto-lint)")
     turn_parser.add_argument("--worktree", action="store_true", help="Run the turn inside an isolated git worktree and branch")
     turn_parser.add_argument("--no-auto-merge", action="store_true", help="Do not auto-merge the worktree on turn completion")
+    turn_parser.add_argument("-v", "--verbose", action="store_true", help="Include full thinking traces and raw startup banners in output")
     turn_parser.add_argument("--cwd", default=".", help="Project working directory")
     
     clean_parser = subparsers.add_parser("cleanup", help="Clean up session history file")
@@ -628,7 +661,7 @@ def main():
         run_turn(args.task_id, args.message, args.files, cwd_path, 
                  read_files=args.read_files, restore=args.restore, model=args.model,
                  lint_cmd=args.lint_cmd, worktree=args.worktree,
-                 auto_merge=not args.no_auto_merge)
+                 auto_merge=not args.no_auto_merge, verbose=args.verbose)
     elif args.command == "cleanup":
         cleanup_session(args.task_id, cwd_path)
     elif args.command == "merge-worktree":

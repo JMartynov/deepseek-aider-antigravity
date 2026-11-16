@@ -220,3 +220,34 @@ def test_auto_rebase_on_advancing_base_branch():
         log_res = subprocess.run(["git", "log", "--oneline"], cwd=tmppath, capture_output=True, text=True)
         assert "Commit in Task A" in log_res.stdout
         assert "Base advanced to v2" in log_res.stdout
+
+
+def test_filter_turn_output_strips_thinking_and_banners():
+    sample_raw = (
+        "Detected dumb terminal, disabling fancy input and pretty output.\n"
+        "Aider v0.86.2\n"
+        "Cost estimates may be inaccurate when using streaming and caching.\n"
+        "Scraping https://github.com/example/repo...\n"
+        "Added src/foo.py to the chat.\n"
+        "► **THINKING**\n"
+        "This is internal chain of thought with thousands of tokens of reasoning\n"
+        "that shouldn't waste orchestrator context.\n"
+        "► **ANSWER**\n"
+        "Applied surgical unified diff:\n"
+        "```diff\n"
+        "+ def foo(): return True\n"
+        "```\n"
+    )
+
+    filtered = aider_bridge.filter_turn_output(sample_raw, verbose=False)
+    assert "Detected dumb terminal" not in filtered
+    assert "Aider v0.86.2" not in filtered
+    assert "Scraping https" not in filtered
+    assert "► **THINKING**" not in filtered
+    assert "internal chain of thought" not in filtered
+    assert "Added src/foo.py to the chat." in filtered
+    assert "+ def foo(): return True" in filtered
+
+    # Verbose keeps thinking
+    verbose_out = aider_bridge.filter_turn_output(sample_raw, verbose=True)
+    assert "► **THINKING**" in verbose_out

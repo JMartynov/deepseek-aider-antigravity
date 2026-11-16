@@ -53,6 +53,10 @@ A high-efficiency coding sub-agent skill designed for the **Antigravity Lead Arc
 - **Diff Edit Format (`edit-format: diff`)**: Forces the model to emit only search/replace blocks. Never let models reprint full 500-line files.
 - **Map Tokens Disabled (`map-tokens: 0`)**: Disabling Aider's AST repo-map avoids token bloat, prevents large cross-file scans, and avoids platform-dependent native compiler prompts.
 - **Prefix Caching (`cache-prompts: true` + `cache-keepalive-pings: 6`)**: DeepSeek hardware caches identical prompt prefixes. The bridge automatically supplies an ephemeral model settings file for `deepseek/deepseek-flash` ensuring `caches_by_default: true` and `edit_format: diff`. When resuming sessions with `--restore`, unchanged system instructions and file context are served from cache at a ~90% discount.
+- **Orchestrator Token Sieve**:
+  - Automatically strips DeepSeek internal `► **THINKING** ... ► **ANSWER**` blocks before reporting turn output, preventing thousands of reasoning tokens from bloating orchestrator conversation context.
+  - Automatically suppresses startup noise and disables web URL scraping via `--no-detect-urls`.
+  - Pass `-v` / `--verbose` only when low-level reasoning inspection is required.
 
 ### 2. Strict Scope Bounding & Reference Safety
 - **Pass explicit target files only**: Never pass broad glob patterns (e.g. `src/**/*.py`).
