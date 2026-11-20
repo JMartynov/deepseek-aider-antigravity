@@ -137,6 +137,27 @@ python3 scripts/aider_bridge.py cleanup \
 
 ---
 
+## 🏛️ Architecture & Division of Labor
+
+DeepSeek runs as a pure remote model via API. It **does not install dependencies or run arbitrary shell commands directly**. The execution environment and lifecycle are strictly partitioned:
+
+| Capability | Lead Orchestrator (Antigravity) | DeepSeek Sub-Agent (via Aider) |
+| :--- | :--- | :--- |
+| **Dependency Resolution** | Owns `uv add`, `uv sync`, `pip install`, or `.venv` creation. | Edits `pyproject.toml` or `requirements.txt` via unified diffs. |
+| **Python Environment** | Manages local virtualenv (`uv` / `.venv`) and parent tasks. | Runs inside the parent project / worktree Python environment. |
+| **Test Execution** | Runs integration suites (`uv run pytest tests/`, `npm test`, etc.). | Auto-lints via `--lint-cmd`; fixes tests via `--auto-test --test-cmd`. |
+| **Web Research** | Performs live web searches (`search_web`) or dynamic browser exploration (`browser` sub-agent). | Disabled by design (`--no-detect-urls`) to avoid token waste. |
+| **OS CLI Execution** | Full shell access via `run_command` (git, build systems, background tasks). | Restricted to unified diff file modifications inside isolated worktrees. |
+
+### Orchestrator Pre-Check Gate (Task Readiness Checklist)
+Before dispatching a task to DeepSeek:
+1. **Dependency Pre-Check**: Ensure the local environment is synced (`uv sync --extra dev`).
+2. **File & Scope Pre-Check**: Ensure all target files and reference files exist and are correctly identified up front to avoid exploratory search loops.
+3. **External Research Pre-Synthesis**: Research external API behavior upfront and supply the contract in the prompt or `--read-files`.
+4. **Worktree Isolation**: Use `--worktree` and `--no-auto-merge` for clean branch isolation and multi-pass reviews.
+
+---
+
 ## 🧪 Automated Testing & CI
 
 Every invariant and failure mode is guarded by automated test suites in `tests/`:

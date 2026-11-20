@@ -84,6 +84,32 @@ A high-efficiency coding sub-agent skill designed for the **Antigravity Lead Arc
 - **Auto-Linting**: Enabled by default using `python -m py_compile` (or user `--lint-cmd`). If DeepSeek introduces a syntax error, Aider feeds the error back to DeepSeek to self-heal in the same turn.
 - **Atomic Rollback**: If a diff collision occurs or the edit fails, all modified target files are restored (`git checkout -- <file>`) and incomplete untracked files are deleted.
 
+### 6. Dependency, Environment & Capability Division of Labor
+
+DeepSeek runs as a pure remote Large Language Model accessed via API. It **does NOT install packages or execute arbitrary shell commands directly**. The execution environment and dependency lifecycle are strictly divided between the Orchestrator and DeepSeek:
+
+| Capability | Orchestrator (Antigravity) | DeepSeek Sub-Agent (via Aider) |
+| :--- | :--- | :--- |
+| **Dependency Resolution** | Owns `uv add`, `uv sync`, `pip install`, or `.venv` creation. | Edits `pyproject.toml` or `requirements.txt` via unified diffs. |
+| **Python Environment** | Manages local virtualenv (`uv` / `.venv`) and parent tasks. | Runs inside the parent project / worktree Python environment. |
+| **Test Execution** | Runs integration suites (`uv run pytest tests/`, `npm test`, etc.). | Auto-lints via `--lint-cmd`; fixes tests via `--auto-test --test-cmd`. |
+| **Web Research** | Performs live web searches (`search_web`) or dynamic browser exploration (`browser` sub-agent). | Disabled by design (`--no-detect-urls`) to avoid token waste. |
+| **OS CLI Execution** | Full shell access via `run_command` (git, build systems, background tasks). | Restricted to unified diff file modifications inside isolated worktrees. |
+
+### 7. Orchestrator Pre-Check Gate (Task Readiness Protocol)
+
+Before delegating any implementation or refactoring task to DeepSeek, the lead orchestrator **MUST pre-check that all prerequisite conditions are ready**:
+
+1. **Environment & Dependency Pre-Check**:
+   - Ensure the virtual environment is synced (`uv sync --extra dev` or equivalent). If DeepSeek is asked to write code using a third-party library, verify the library is already installed or explicitly instruct DeepSeek to update `pyproject.toml`.
+2. **File & Dependency Scoping Pre-Check**:
+   - Verify that all target editable files (`--files`) and reference contracts (`--read-files`) exist. Missing read-only references trigger exit code `14` (`PREFLIGHT_FAILED`).
+   - Pre-check that internal dependencies (fixtures, helper modules, subpackages) are located beforehand so the worker sub-agent doesn't waste tokens running exploratory `grep` / `find` loops.
+3. **External Research Pre-Synthesis**:
+   - If a task involves external APIs or third-party library behaviors, the orchestrator must perform the web research upfront and supply the contract in the `--message` prompt or as a `--read-files` specification.
+4. **Isolated Worktree Hygiene**:
+   - Ensure working tree is clean or use `--worktree` to branch off cleanly without dirty working tree collisions.
+
 ---
 
 ## 🛠️ CLI Orchestrator Command Reference
