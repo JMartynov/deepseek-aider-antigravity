@@ -446,6 +446,8 @@ def run_preflight_checks(read_files: list[str], cwd: Path):
 def run_turn(task_id: str, message: str, files: list[str], cwd: Path, 
              read_files: list[str] = None, restore: bool = False, 
              model: str = "deepseek/deepseek-flash", lint_cmd: str = None,
+             test_cmd: str = None, dry_run: bool = False,
+             architect: bool = False, editor_model: str = None,
              worktree: bool = False, auto_merge: bool = True,
              verbose: bool = False):
     if worktree:
@@ -456,7 +458,9 @@ def run_turn(task_id: str, message: str, files: list[str], cwd: Path,
         try:
             run_turn(task_id, message, files, worktree_path,
                      read_files=read_files, restore=restore, model=model,
-                     lint_cmd=lint_cmd, worktree=False, verbose=verbose)
+                     lint_cmd=lint_cmd, test_cmd=test_cmd, dry_run=dry_run,
+                     architect=architect, editor_model=editor_model,
+                     worktree=False, verbose=verbose)
         except SystemExit as e:
             code = e.code if isinstance(e.code, int) else (0 if e.code is None else 1)
             if code == 0:
@@ -534,6 +538,23 @@ def run_turn(task_id: str, message: str, files: list[str], cwd: Path,
     resolved_lint_cmd = detect_lint_cmd(files, lint_cmd)
     if resolved_lint_cmd:
         cmd.extend(["--auto-lint", "--lint-cmd", resolved_lint_cmd])
+
+    # Closed-loop TDD: let Aider run tests and self-heal failing assertions
+    if test_cmd:
+        cmd.extend(["--auto-test", "--test-cmd", test_cmd])
+
+    # Dry-run: propose diffs without writing to disk
+    if dry_run:
+        cmd.append("--dry-run")
+
+    # Architect mode (two-model: architect + editor)
+    resolved_editor_model = editor_model
+    if architect:
+        cmd.append("--architect")
+        if not resolved_editor_model and model == "deepseek/deepseek-reasoner":
+            resolved_editor_model = "deepseek/deepseek-flash"
+    if resolved_editor_model:
+        cmd.extend(["--editor-model", resolved_editor_model])
     
     # Fallback if no git repo
     if not (cwd / ".git").exists():
@@ -637,6 +658,10 @@ def main():
     turn_parser.add_argument("--restore", action="store_true", help="Restore prior turn session history for prefix cache")
     turn_parser.add_argument("--model", default="deepseek/deepseek-flash", help="Model name (default: deepseek/deepseek-flash)")
     turn_parser.add_argument("--lint-cmd", default=None, help="Custom lint command passed to Aider (enables --auto-lint)")
+    turn_parser.add_argument("--test-cmd", default=None, help="Test command (enables --auto-test; Aider self-heals failing tests)")
+    turn_parser.add_argument("--dry-run", action="store_true", help="Run Aider in dry-run mode (proposes diffs without writing)")
+    turn_parser.add_argument("--architect", action="store_true", help="Enable two-model architect mode (--architect)")
+    turn_parser.add_argument("--editor-model", default=None, help="Editor model for architect mode (defaults to deepseek/deepseek-flash for reasoner)")
     turn_parser.add_argument("--worktree", action="store_true", help="Run the turn inside an isolated git worktree and branch")
     turn_parser.add_argument("--no-auto-merge", action="store_true", help="Do not auto-merge the worktree on turn completion")
     turn_parser.add_argument("-v", "--verbose", action="store_true", help="Include full thinking traces and raw startup banners in output")
@@ -660,7 +685,9 @@ def main():
     if args.command == "turn":
         run_turn(args.task_id, args.message, args.files, cwd_path, 
                  read_files=args.read_files, restore=args.restore, model=args.model,
-                 lint_cmd=args.lint_cmd, worktree=args.worktree,
+                 lint_cmd=args.lint_cmd, test_cmd=args.test_cmd,
+                 dry_run=args.dry_run, architect=args.architect,
+                 editor_model=args.editor_model, worktree=args.worktree,
                  auto_merge=not args.no_auto_merge, verbose=args.verbose)
     elif args.command == "cleanup":
         cleanup_session(args.task_id, cwd_path)

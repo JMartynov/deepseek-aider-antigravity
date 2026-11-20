@@ -18,6 +18,8 @@ Designed for intense daily programming workflows (up to 5 hours/day) while stric
 - **Atomic Rollback on Diff Collisions**: Automatically reverts modified tracked files via `git checkout` and purges incomplete untracked files if an edit fails to apply.
 - **Universal Auto-Lint**: Defaults to `python:python -m py_compile` (or custom `--lint-cmd`) so DeepSeek catches and self-heals syntax errors within the same turn.
 - **Read-Only Scope Protection**: Supports `--read-files` to open reference schemas and interfaces with `--read`, preventing accidental edits to read-only code.
+- **Closed-Loop TDD Delegation**: `--test-cmd <cmd>` wires `--auto-test --test-cmd` so failing tests are fed back to DeepSeek for self-healing within the same turn (best combined with `--worktree`/`--no-auto-merge`).
+- **Dry-Run & Architect Modes**: `--dry-run` proposes diffs without writing; `--architect` enables two-model editing where `--editor-model` defaults to `deepseek/deepseek-flash` when `--model` is `deepseek/deepseek-reasoner`.
 
 ---
 
@@ -135,6 +137,29 @@ python3 scripts/aider_bridge.py cleanup \
   --cwd "<project_dir>"
 ```
 
+### 4. Advanced Turn Options
+```bash
+# Closed-loop TDD inside an isolated worktree
+python3 scripts/aider_bridge.py turn \
+  --task-id "<task_id>" \
+  --message "Implement feature and make tests pass." \
+  --files feature.py \
+  --test-cmd "uv run pytest tests/test_feature.py -q" \
+  --worktree --no-auto-merge \
+  --cwd "<project_dir>"
+
+# Dry-run plan review (no disk writes)
+python3 scripts/aider_bridge.py turn \
+  --task-id "<task_id>" --message "Plan refactor." --files feature.py --dry-run \
+  --cwd "<project_dir>"
+
+# Architect mode (editor defaults to deepseek/deepseek-flash with reasoner model)
+python3 scripts/aider_bridge.py turn \
+  --task-id "<task_id>" --message "Design and implement." --files feature.py \
+  --model deepseek/deepseek-reasoner --architect \
+  --cwd "<project_dir>"
+```
+
 ---
 
 ## 🏛️ Architecture & Division of Labor
@@ -155,6 +180,14 @@ Before dispatching a task to DeepSeek:
 2. **File & Scope Pre-Check**: Ensure all target files and reference files exist and are correctly identified up front to avoid exploratory search loops.
 3. **External Research Pre-Synthesis**: Research external API behavior upfront and supply the contract in the prompt or `--read-files`.
 4. **Worktree Isolation**: Use `--worktree` and `--no-auto-merge` for clean branch isolation and multi-pass reviews.
+
+### Closed-Loop TDD Delegation Pattern
+Pass `--test-cmd <cmd>` alongside `--worktree --no-auto-merge` to run a full isolated TDD loop: DeepSeek applies surgical diffs, Aider immediately runs `--auto-test --test-cmd <cmd>`, and any failing assertions are fed back to the model to self-heal before the turn completes (exit `0` only when tests pass). Review the worktree, then merge explicitly with `merge-worktree`.
+
+Additional advanced flags:
+- **`--test-cmd <cmd>`** — enables `--auto-test --test-cmd <cmd>` (self-healing test loop).
+- **`--dry-run`** — propose diffs without writing to disk (low-cost plan review).
+- **`--architect` / `--editor-model <name>`** — two-model architect workflow; with `--model deepseek/deepseek-reasoner --architect`, the editor defaults to `deepseek/deepseek-flash` unless overridden.
 
 ---
 

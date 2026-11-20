@@ -251,3 +251,105 @@ def test_filter_turn_output_strips_thinking_and_banners():
     # Verbose keeps thinking
     verbose_out = aider_bridge.filter_turn_output(sample_raw, verbose=True)
     assert "► **THINKING**" in verbose_out
+
+
+def _invoke_turn_and_capture(monkeypatch, tmppath, argv_tail):
+    """Helper: run main() with a mocked subprocess.run and return the aider (uvx) cmd."""
+    import pytest
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
+    captured = {}
+
+    def mock_run(cmd, cwd=None, capture_output=True, text=True):
+        # Only capture the aider invocation; ignore git/worktree housekeeping cmds.
+        if cmd and cmd[0] == "uvx":
+            captured["cmd"] = list(cmd)
+        class Ret:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+        return Ret()
+
+    monkeypatch.setattr(aider_bridge.subprocess, "run", mock_run)
+    monkeypatch.setattr(aider_bridge, "fetch_account_balance", lambda *a, **k: None)
+    monkeypatch.setattr(sys, "argv", ["aider_bridge.py", "turn"] + argv_tail + ["--cwd", str(tmppath)])
+
+    with pytest.raises(SystemExit) as exc:
+        aider_bridge.main()
+    assert exc.value.code == 0
+    assert "cmd" in captured, "Aider (uvx) subprocess was not invoked"
+    return captured["cmd"]
+
+
+def test_test_cmd_argument_wiring(monkeypatch):
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmppath = Path(tmpdir)
+        cmd = _invoke_turn_and_capture(
+            monkeypatch, tmppath,
+            ["--task-id", "t1", "--message", "m", "--files", "foo.py", "--test-cmd", "pytest tests/"],
+        )
+        assert "--auto-test" in cmd
+        idx = cmd.index("--test-cmd")
+        assert cmd[idx + 1] == "pytest tests/"
+
+
+def test_dry_run_argument_wiring(monkeypatch):
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmppath = Path(tmpdir)
+        cmd = _invoke_turn_and_capture(
+            monkeypatch, tmppath,
+            ["--task-id", "t2", "--message", "m", "--files", "foo.py", "--dry-run"],
+        )
+        assert "--dry-run" in cmd
+
+
+def test_architect_argument_wiring(monkeypatch):
+    # Architect with default flash model: --architect only, no editor override
+    with tempfile.TemporaryDirectory() as tmpdir:
+        cmd = _invoke_turn_and_capture(
+            monkeypatch, Path(tmpdir),
+            ["--task-id", "t3", "--message", "m", "--files", "foo.py", "--architect"],
+        )
+        assert "--architect" in cmd
+        assert "--editor-model" not in cmd
+
+    # Architect with reasoner model: editor defaults to deepseek/deepseek-flash
+    with tempfile.TemporaryDirectory() as tmpdir:
+        cmd = _invoke_turn_and_capture(
+            monkeypatch, Path(tmpdir),
+            ["--task-id", "t4", "--message", "m", "--files", "foo.py",
+             "--model", "deepseek/deepseek-reasoner", "--architect"],
+        )
+        assert "--architect" in cmd
+        idx = cmd.index("--editor-model")
+        assert cmd[idx + 1] == "deepseek/deepseek-flash"
+
+    # Explicit --editor-model override wins over the reasoner default
+    with tempfile.TemporaryDirectory() as tmpdir:
+        cmd = _invoke_turn_and_capture(
+            monkeypatch, Path(tmpdir),
+            ["--task-id", "t5", "--message", "m", "--files", "foo.py",
+             "--model", "deepseek/deepseek-reasoner", "--architect",
+             "--editor-model", "custom/editor"],
+        )
+        assert "--architect" in cmd
+        idx = cmd.index("--editor-model")
+        assert cmd[idx + 1] == "custom/editor"
+
+
+def test_worktree_forwards_advanced_flags(monkeypatch):
+    """worktree=True recursion must still forward test_cmd/dry_run/architect/editor_model."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        cmd = _invoke_turn_and_capture(
+            monkeypatch, Path(tmpdir),
+            ["--task-id", "wt1", "--message", "m", "--files", "foo.py",
+             "--test-cmd", "pytest -q", "--dry-run",
+             "--model", "deepseek/deepseek-reasoner", "--architect",
+             "--worktree", "--no-auto-merge"],
+        )
+        assert "--auto-test" in cmd
+        idx = cmd.index("--test-cmd")
+        assert cmd[idx + 1] == "pytest -q"
+        assert "--dry-run" in cmd
+        assert "--architect" in cmd
+        idx = cmd.index("--editor-model")
+        assert cmd[idx + 1] == "deepseek/deepseek-flash"

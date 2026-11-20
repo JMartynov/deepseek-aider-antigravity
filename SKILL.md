@@ -110,6 +110,13 @@ Before delegating any implementation or refactoring task to DeepSeek, the lead o
 4. **Isolated Worktree Hygiene**:
    - Ensure working tree is clean or use `--worktree` to branch off cleanly without dirty working tree collisions.
 
+### 8. Closed-Loop TDD Delegation & Advanced Turn Flags
+
+- **Closed-Loop TDD Delegation Pattern**: Pass `--test-cmd <cmd>` (e.g. `pytest tests/ -q`) so Aider runs `--auto-test --test-cmd <cmd>` after applying edits and feeds failing test output back to DeepSeek to self-heal within the same turn. Combine with `--worktree` and `--no-auto-merge` for isolated multi-pass TDD: implementation → auto-test self-heal → review → explicit `merge-worktree`.
+- **`--test-cmd <cmd>`**: Enables `--auto-test --test-cmd <cmd>` so the sub-agent verifies and repairs failing tests before returning (exit `0` only when tests pass).
+- **`--dry-run`**: Runs Aider in dry-run mode — diffs are proposed but not written to disk, ideal for low-cost plan/spec review.
+- **`--architect` / `--editor-model`**: Enables a two-model architect workflow (`--architect`). When using `--model deepseek/deepseek-reasoner --architect` and no `--editor-model` is supplied, the editor model defaults to the cheaper/faster `deepseek/deepseek-flash`; pass `--editor-model <name>` to override. `--editor-model` is also honoured without `--architect`.
+
 ---
 
 ## 🛠️ CLI Orchestrator Command Reference
@@ -144,6 +151,30 @@ After test verification succeeds:
 ```bash
 python3 ~/.gemini/config/skills/aider-deepseek/scripts/aider_bridge.py cleanup \
   --task-id "auth_service_01" \
+  --cwd "/path/to/project"
+```
+
+### Step 4: Advanced Turn Flags (TDD, Dry-Run, Architect)
+
+```bash
+# Closed-loop TDD inside an isolated worktree (auto-test self-heal, then explicit merge)
+python3 ~/.gemini/config/skills/aider-deepseek/scripts/aider_bridge.py turn \
+  --task-id "auth_service_02" \
+  --message "Implement verify_token and make the tests pass." \
+  --files auth.py \
+  --test-cmd "uv run pytest tests/test_auth.py -q" \
+  --worktree --no-auto-merge \
+  --cwd "/path/to/project"
+
+# Dry-run plan review (proposes diffs without writing to disk)
+python3 ~/.gemini/config/skills/aider-deepseek/scripts/aider_bridge.py turn \
+  --task-id "auth_plan" --message "Plan the refactor." --files auth.py --dry-run \
+  --cwd "/path/to/project"
+
+# Architect mode with reasoner model (editor defaults to deepseek/deepseek-flash)
+python3 ~/.gemini/config/skills/aider-deepseek/scripts/aider_bridge.py turn \
+  --task-id "auth_arch" --message "Design and implement verify_token." --files auth.py \
+  --model deepseek/deepseek-reasoner --architect \
   --cwd "/path/to/project"
 ```
 
