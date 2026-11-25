@@ -12,8 +12,10 @@ import sys
 import time
 import json
 import argparse
+import http.client
 import shutil
 import subprocess
+import tempfile
 import urllib.request
 import urllib.error
 import uuid
@@ -24,6 +26,54 @@ from contextlib import contextmanager
 
 ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
 THINKING_BLOCK_RE = re.compile(r"► \*\*THINKING\*\*.*?► \*\*ANSWER\*\*", re.DOTALL)
+_TASK_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+_BEARER_RE = re.compile(r"(Bearer\s+)\S+", re.IGNORECASE)
+_SK_TOKEN_RE = re.compile(r"\bsk-[A-Za-z0-9_-]{8,}\b")
+
+
+def validate_task_id(task_id: str) -> str:
+    """Validate that task_id is a safe single-segment identifier for paths and git branch names."""
+    if not isinstance(task_id, str) or not _TASK_ID_RE.match(task_id):
+        raise ValueError(
+            f"Invalid task_id {task_id!r}: must match ^[A-Za-z0-9][A-Za-z0-9._-]{{0,127}}$"
+        )
+    if ".." in task_id or task_id.endswith(".lock") or task_id.endswith("."):
+        raise ValueError(f"Invalid task_id {task_id!r}: unsafe path or git ref sequence.")
+    return task_id
+
+
+def _sanitize_secret(text: str, secret: str = None) -> str:
+    """Redact API keys and bearer tokens from diagnostic or error strings."""
+    if not text:
+        return ""
+    out = str(text)
+    for tok in (secret, os.environ.get("DEEPSEEK_API_KEY")):
+        if tok:
+            out = out.replace(tok, "[REDACTED]")
+    out = _BEARER_RE.sub(r"\1[REDACTED]", out)
+    out = _SK_TOKEN_RE.sub("[REDACTED]", out)
+    return out
+
+
+def _write_state_atomic(state_file: Path, state: dict):
+    """Write session state.json atomically via temp file + os.replace."""
+    state_file.parent.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps(state, indent=2)
+    fd, tmp_name = tempfile.mkstemp(
+        dir=str(state_file.parent), prefix=".state.", suffix=".tmp"
+    )
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(payload)
+            fh.flush()
+        os.replace(tmp_path, state_file)
+    except Exception:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
 
 
 def strip_thinking_block(text: str) -> str:
@@ -88,7 +138,7 @@ def fetch_account_balance(api_key: str):
                     "topped_up_balance": info.get("topped_up_balance", "0.00")
                 }
     except Exception as e:
-        return {"error": str(e)}
+        return {"error": _sanitize_secret(str(e), api_key)}
     return None
 
 
@@ -152,6 +202,8 @@ def _search_via_chat_completions(query, api_key, count, need_content, timeout):
 def search_web_deepseek(query: str, api_key: str, count: int = 5,
                         need_content: bool = False, timeout: float = 15.0) -> dict:
     """POST to DeepSeek search tool endpoint; fall back to chat-completions on 404/405."""
+    if timeout is not None and timeout <= 0:
+        raise ValueError(f"timeout must be positive (got {timeout!r})")
     url = "https://api.deepseek.com/v1/tools/search"
     body = {"query": query, "count": count, "need_content": need_content}
     req = urllib.request.Request(
@@ -169,7 +221,15 @@ def search_web_deepseek(query: str, api_key: str, count: int = 5,
             return json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
         if getattr(e, "code", None) in (404, 405):
+            if hasattr(e, "close"):
+                e.close()
             return _search_via_chat_completions(query, api_key, count, need_content, timeout)
+        if getattr(e, "msg", None):
+            e.msg = _sanitize_secret(str(e.msg), api_key)
+        raise
+    except urllib.error.URLError as e:
+        if getattr(e, "reason", None):
+            e.reason = _sanitize_secret(str(e.reason), api_key)
         raise
 
 
@@ -372,6 +432,12 @@ def run_dispatch(task_id: str, message: str, files: list[str], cwd: Path,
     Classify a task into its optimal precision tier and dispatch it to the
     matching model/thinking/edit-format configuration (or DeepSeek search).
     """
+    try:
+        validate_task_id(task_id)
+    except ValueError as e:
+        print(f"[ERROR] Security violation: {e}", file=sys.stderr)
+        sys.exit(12)
+
     tier_name, reasoning, resolved = classify_task(
         message, files=files, read_files=read_files,
         test_cmd=test_cmd, forced_tier=tier,
@@ -485,11 +551,17 @@ def run_search(query: str, cwd: Path, count: int = 5,
             sys.exit(16)
         print(f"[ERROR] DeepSeek search API error (HTTP {code}).", file=sys.stderr)
         sys.exit(17)
-    except (urllib.error.URLError, TimeoutError, OSError) as e:
-        print(f"[ERROR] Network error contacting DeepSeek search API: {e}", file=sys.stderr)
+    except (urllib.error.URLError, TimeoutError, OSError, http.client.HTTPException) as e:
+        print(
+            f"[ERROR] Network error contacting DeepSeek search API: {_sanitize_secret(str(e), api_key)}",
+            file=sys.stderr,
+        )
         sys.exit(18)
     except (json.JSONDecodeError, ValueError) as e:
-        print(f"[ERROR] Invalid JSON response from DeepSeek search API: {e}", file=sys.stderr)
+        print(
+            f"[ERROR] Invalid JSON response from DeepSeek search API: {_sanitize_secret(str(e), api_key)}",
+            file=sys.stderr,
+        )
         sys.exit(19)
 
     if as_json:
@@ -500,21 +572,46 @@ def run_search(query: str, cwd: Path, count: int = 5,
 
 def get_session_dir(task_id: str, cwd: Path) -> Path:
     """Return the structured session directory for a task."""
+    validate_task_id(task_id)
     return cwd / ".aider-sessions" / task_id
 
 
+def _parse_env_value(raw: str) -> str:
+    """Parse a single .env value, handling matching quotes and trailing comments."""
+    val = raw.strip()
+    if not val:
+        return ""
+    if val[0] in ("'", '"'):
+        quote = val[0]
+        i = 1
+        while i < len(val):
+            if quote == '"' and val[i] == "\\" and i + 1 < len(val):
+                i += 2
+                continue
+            if val[i] == quote:
+                inner = val[1:i]
+                if quote == '"':
+                    inner = inner.replace('\\"', '"').replace("\\\\", "\\")
+                return inner
+            i += 1
+        return val[1:]
+    return re.sub(r"\s+#.*$", "", val).strip()
+
+
 def load_project_env(cwd: Path):
-    """Load DEEPSEEK_API_KEY from project .env file only."""
+    """Load environment variables from project .env file (without overwriting existing env)."""
     env_file = cwd / ".env"
     if env_file.exists():
         for line in env_file.read_text().splitlines():
             line = line.strip()
             if line and not line.startswith("#") and "=" in line:
                 k, v = line.split("=", 1)
-                k = k.strip()
-                v = v.strip().strip("'\"")
+                k = re.sub(r"^export\s+", "", k.strip()).strip()
+                if not k or not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", k):
+                    continue
+                parsed_v = _parse_env_value(v)
                 if k not in os.environ:
-                    os.environ[k] = v
+                    os.environ[k] = parsed_v
 
 
 def _parse_token_count(raw: str) -> float:
@@ -640,27 +737,40 @@ def extract_questions(output: str):
     current_q = None
     q_indent = 0
     fence_len = None
-    in_options = False
+    options_bracket_depth = 0
 
     def _update_options_state(trimmed_line: str):
-        nonlocal in_options
-        opt_pos = trimmed_line.upper().find("[OPTIONS:")
+        nonlocal options_bracket_depth
+        upper = trimmed_line.upper()
+        opt_pos = upper.find("[OPTIONS:")
         if opt_pos == -1:
-            opt_pos = trimmed_line.upper().find("[OPTION:")
+            opt_pos = upper.find("[OPTION:")
         if opt_pos != -1:
-            tail = trimmed_line[opt_pos + 1:]
-            in_options = "]" not in tail
-        elif in_options and "]" in trimmed_line:
-            in_options = False
+            depth = 0
+            for ch in trimmed_line[opt_pos:]:
+                if ch == "[":
+                    depth += 1
+                elif ch == "]":
+                    depth = max(0, depth - 1)
+            options_bracket_depth = depth
+        elif options_bracket_depth > 0:
+            for ch in trimmed_line:
+                if ch == "[":
+                    options_bracket_depth += 1
+                elif ch == "]":
+                    options_bracket_depth -= 1
+                    if options_bracket_depth <= 0:
+                        options_bracket_depth = 0
+                        break
 
     def _flush_question():
-        nonlocal current_q, in_options
+        nonlocal current_q, options_bracket_depth
         if current_q is not None:
             joined = "\n".join(current_q).strip()
             if joined:
                 questions.append(joined)
         current_q = None
-        in_options = False
+        options_bracket_depth = 0
 
     for i, line in enumerate(lines):
         trimmed = line.strip()
@@ -714,7 +824,7 @@ def extract_questions(output: str):
             continue
 
         if not trimmed:
-            if _should_continue_after_blank(lines, i, q_indent, in_options):
+            if _should_continue_after_blank(lines, i, q_indent, options_bracket_depth > 0):
                 current_q.append("")
             else:
                 _flush_question()
@@ -727,38 +837,57 @@ def extract_questions(output: str):
     return questions
 
 
+def _find_bracket_tag(text: str, tag_pattern: str):
+    """Find '[TAG: ...]' with balanced inner square brackets (e.g., dict[str, int])."""
+    m = re.search(rf"\[(?:{tag_pattern}):", text, re.IGNORECASE)
+    if not m:
+        return None
+    start = m.start()
+    content_start = m.end()
+    depth = 1
+    for pos in range(content_start, len(text)):
+        ch = text[pos]
+        if ch == "[":
+            depth += 1
+        elif ch == "]":
+            depth -= 1
+            if depth == 0:
+                return start, pos + 1, text[content_start:pos]
+    return None
+
+
 def parse_structured_question(raw_question: str, seq: int = 1) -> dict:
     """Parse a structured QUESTION block into a structured event dict."""
     cleaned = (raw_question or "").strip()
 
-    stage_match = re.search(r"\[STAGE:\s*([^\]]+)\]", cleaned, re.IGNORECASE)
-    stage = stage_match.group(1).strip().upper() if stage_match else "IMPLEMENTATION"
+    stage_tag = _find_bracket_tag(cleaned, r"STAGE")
+    stage = stage_tag[2].strip().upper() if stage_tag else "IMPLEMENTATION"
 
-    category_match = re.search(r"\[CATEGORY:\s*([^\]]+)\]", cleaned, re.IGNORECASE)
-    category = category_match.group(1).strip().upper() if category_match else None
+    category_tag = _find_bracket_tag(cleaned, r"CATEGORY")
+    category = category_tag[2].strip().upper() if category_tag else None
 
-    impact_match = re.search(r"\[IMPACT:\s*([^\]]+)\]", cleaned, re.IGNORECASE)
-    impact = impact_match.group(1).strip().upper() if impact_match else None
+    impact_tag = _find_bracket_tag(cleaned, r"IMPACT")
+    impact = impact_tag[2].strip().upper() if impact_tag else None
 
-    rec_match = re.search(r"\[RECOMMENDATION:\s*([^\]]+)\]", cleaned, re.IGNORECASE)
-    recommendation = rec_match.group(1).strip() if rec_match else None
+    rec_tag = _find_bracket_tag(cleaned, r"RECOMMENDATION")
+    recommendation = rec_tag[2].strip() if rec_tag else None
 
     options = []
-    options_span = None
-    opt_match = re.search(r"\[OPTIONS?:(.*?)\]", cleaned, re.IGNORECASE | re.DOTALL)
-    if opt_match:
-        options_span = opt_match.span()
+    opt_tag = _find_bracket_tag(cleaned, r"OPTIONS?")
+    if opt_tag:
         for m in re.finditer(
             r"([A-Z])\)\s*(.+?)(?=(?:\s+[A-Z]\)\s|\n|\Z))",
-            opt_match.group(1),
+            opt_tag[2],
         ):
             options.append({"key": m.group(1), "summary": m.group(2).strip()})
 
     body = cleaned
-    if options_span:
-        body = body[:options_span[0]] + body[options_span[1]:]
-    body = re.sub(r"\[(?:STAGE|CATEGORY|IMPACT|RECOMMENDATION):[^\]]*\]", "", body, flags=re.IGNORECASE)
-    body = re.sub(r"\[OPTIONS?:[^\]]*\]", "", body, flags=re.IGNORECASE)
+    for tag in (r"OPTIONS?", r"STAGE", r"CATEGORY", r"IMPACT", r"RECOMMENDATION"):
+        while True:
+            found = _find_bracket_tag(body, tag)
+            if not found:
+                break
+            body = body[:found[0]] + body[found[1]:]
     body = body.strip()
 
     return {
@@ -907,23 +1036,44 @@ def create_ephemeral_model_settings(cwd: Path, model: str, editor_model: str = N
 @contextmanager
 def with_git_lock(cwd: Path, timeout: float = 60.0, retry_interval: float = 0.5):
     """
-    Acquire an atomic directory lock (.git/aider_merge.lock.d) to serialize
+    Acquire an atomic directory lock (<git-common-dir>/aider_merge.lock.d) to serialize
     git worktree merges across concurrent sub-agents without index.lock collisions.
     """
-    git_dir = cwd / ".git"
-    if git_dir.is_file():
-        # Inside a worktree, .git is a file pointing to gitdir: ...
-        try:
-            content = git_dir.read_text().strip()
-            if content.startswith("gitdir:"):
-                git_dir = Path(content.split("gitdir:", 1)[1].strip()).resolve()
-                if "worktrees" in str(git_dir):
-                    # Traverse up to common .git root
-                    git_dir = git_dir.parent.parent
-        except Exception:
-            git_dir = cwd / ".git"
+    git_dir = None
+    try:
+        res = subprocess.run(
+            ["git", "rev-parse", "--git-common-dir"],
+            cwd=cwd, capture_output=True, text=True,
+        )
+        if res.returncode == 0 and res.stdout.strip():
+            common_path = Path(res.stdout.strip())
+            if not common_path.is_absolute():
+                common_path = (cwd / common_path).resolve()
+            else:
+                common_path = common_path.resolve()
+            if common_path.exists():
+                git_dir = common_path
+    except Exception:
+        git_dir = None
 
-    lock_dir = git_dir / "aider_merge.lock.d" if git_dir.exists() else cwd / ".aider_merge.lock.d"
+    if git_dir is None:
+        candidate = cwd / ".git"
+        if candidate.is_dir():
+            git_dir = candidate
+        elif candidate.is_file():
+            try:
+                content = candidate.read_text().strip()
+                if content.startswith("gitdir:"):
+                    gd = Path(content.split("gitdir:", 1)[1].strip())
+                    if not gd.is_absolute():
+                        gd = (cwd / gd).resolve()
+                    else:
+                        gd = gd.resolve()
+                    git_dir = gd.parent.parent if gd.parent.name == "worktrees" else gd
+            except Exception:
+                git_dir = None
+
+    lock_dir = git_dir / "aider_merge.lock.d" if (git_dir and git_dir.exists()) else cwd / ".aider_merge.lock.d"
     start_time = time.time()
     acquired = False
 
@@ -951,9 +1101,8 @@ def with_git_lock(cwd: Path, timeout: float = 60.0, retry_interval: float = 0.5)
 def auto_rebase_branch_if_needed(branch_name: str, cwd: Path, base_branch: str = "main"):
     """
     Check if base branch has advanced ahead of task branch. If so, rebase task
-    branch onto the updated base branch to maintain clean linear history.
+    branch onto the updated base branch and restore checkout to base branch.
     """
-    # Detect current base branch if not provided
     head_check = subprocess.run(
         ["git", "rev-parse", "--abbrev-ref", "HEAD"],
         cwd=cwd, capture_output=True, text=True
@@ -961,7 +1110,6 @@ def auto_rebase_branch_if_needed(branch_name: str, cwd: Path, base_branch: str =
     current_head = head_check.stdout.strip() if head_check.returncode == 0 else base_branch
     target_base = current_head if current_head and current_head != "HEAD" else base_branch
 
-    # Find merge base between base branch and task branch
     merge_base = subprocess.run(
         ["git", "merge-base", target_base, branch_name],
         cwd=cwd, capture_output=True, text=True
@@ -982,17 +1130,20 @@ def auto_rebase_branch_if_needed(branch_name: str, cwd: Path, base_branch: str =
                 subprocess.run(["git", "rebase", "--abort"], cwd=cwd, capture_output=True)
             else:
                 print(f"[REBASE] Successfully rebased {branch_name} onto {target_base}")
+            # Restore cwd to target_base because `git rebase <base> <branch>` checks out <branch>
+            if target_base and target_base != "HEAD":
+                subprocess.run(["git", "checkout", target_base], cwd=cwd, capture_output=True, text=True)
 
 
 def create_task_worktree(task_id: str, cwd: Path, base_branch: str = None) -> tuple[Path, str]:
     """Create (or reuse) the isolated worktree for a task on branch 'task/<task_id>'."""
+    validate_task_id(task_id)
     worktree_path = cwd / ".worktrees" / task_id
     branch_name = f"task/{task_id}"
     if worktree_path.exists():
         print(f"[WORKTREE] Reusing existing worktree: {worktree_path}")
         return worktree_path, branch_name
     worktree_path.parent.mkdir(parents=True, exist_ok=True)
-    # Check if branch already exists
     branch_check = subprocess.run(
         ["git", "show-ref", "--verify", "--quiet", f"refs/heads/{branch_name}"],
         cwd=cwd
@@ -1010,45 +1161,56 @@ def create_task_worktree(task_id: str, cwd: Path, base_branch: str = None) -> tu
     return worktree_path, branch_name
 
 
+def _is_git_tracked(repo_path: Path, rel_path: str) -> bool:
+    """Return True if rel_path is tracked in repo_path."""
+    res = subprocess.run(
+        ["git", "-C", str(repo_path), "ls-files", "--error-unmatch", rel_path],
+        capture_output=True, text=True,
+    )
+    return res.returncode == 0
+
+
 def _commit_worktree_changes_if_dirty(task_id: str, worktree_path: Path):
     """Stage and commit any uncommitted edits in worktree_path before removing it."""
     if not worktree_path.exists():
         return
-    # Remove bridge-copied .env or ephemeral aider files if untracked so they are never committed
-    for ephemeral in (".env", ".aider.input.history", ".aider.chat.history.md"):
-        ep_path = worktree_path / ephemeral
-        if ep_path.exists():
-            tracked = subprocess.run(
-                ["git", "-C", str(worktree_path), "ls-files", "--error-unmatch", ephemeral],
-                capture_output=True, text=True,
-            )
-            if tracked.returncode != 0:
-                try:
+    # Remove bridge-copied .env* or ephemeral .aider* files/dirs if untracked
+    for pattern in (".env*", ".aider*"):
+        for ep_path in worktree_path.glob(pattern):
+            if _is_git_tracked(worktree_path, ep_path.name):
+                continue
+            try:
+                if ep_path.is_dir():
+                    shutil.rmtree(ep_path, ignore_errors=True)
+                else:
                     ep_path.unlink()
-                except OSError:
-                    pass
-    for cache_dir in worktree_path.glob(".aider.tags.cache*"):
-        tracked = subprocess.run(
-            ["git", "-C", str(worktree_path), "ls-files", "--error-unmatch", cache_dir.name],
-            capture_output=True, text=True,
-        )
-        if tracked.returncode != 0:
-            shutil.rmtree(cache_dir, ignore_errors=True)
+            except OSError:
+                pass
 
     status = subprocess.run(
         ["git", "-C", str(worktree_path), "status", "--porcelain"],
         capture_output=True, text=True,
     )
     if status.returncode == 0 and status.stdout.strip():
-        add_res = subprocess.run(
-            ["git", "-C", str(worktree_path), "add", "-A"],
-            capture_output=True, text=True,
-        )
+        add_cmd = [
+            "git", "-C", str(worktree_path), "add", "-A", "--", ".",
+            ":(exclude).env", ":(exclude).env.*",
+            ":(exclude).aider*", ":(exclude).aider-sessions",
+            ":(exclude,glob)**/.env", ":(exclude,glob)**/.env.*",
+            ":(exclude,glob)**/.aider*",
+        ]
+        add_res = subprocess.run(add_cmd, capture_output=True, text=True)
         if add_res.returncode != 0:
             print(
                 f"[WORKTREE] Failed to stage changes in {worktree_path}: {add_res.stderr.strip()}",
                 file=sys.stderr,
             )
+            return
+        staged_check = subprocess.run(
+            ["git", "-C", str(worktree_path), "diff", "--cached", "--quiet"],
+            capture_output=True, text=True,
+        )
+        if staged_check.returncode == 0:
             return
         commit_res = subprocess.run(
             ["git", "-C", str(worktree_path), "commit", "-m", f"chore(aider): apply task {task_id} changes"],
@@ -1061,6 +1223,48 @@ def _commit_worktree_changes_if_dirty(task_id: str, worktree_path: Path):
             )
         else:
             print(f"[WORKTREE] Committed uncommitted changes in {worktree_path}")
+
+
+def _merge_branch_under_lock(branch_name: str, cwd: Path):
+    """Rebase, merge, abort on conflict, and delete branch under the git merge mutex."""
+    with with_git_lock(cwd):
+        auto_rebase_branch_if_needed(branch_name, cwd)
+        merge = subprocess.run(
+            ["git", "merge", "--no-edit", branch_name],
+            cwd=cwd, capture_output=True, text=True
+        )
+        if merge.returncode != 0:
+            subprocess.run(["git", "merge", "--abort"], cwd=cwd, capture_output=True, text=True)
+            print(f"[WORKTREE] Merge failed: {merge.stderr.strip()}", file=sys.stderr)
+            print("[STATUS] MERGE_FAILED", file=sys.stderr)
+            sys.exit(15)
+        print(f"[WORKTREE] Merged {branch_name} into current branch")
+        delete = subprocess.run(
+            ["git", "branch", "-D", branch_name],
+            cwd=cwd, capture_output=True, text=True
+        )
+        if delete.returncode != 0:
+            print(f"[WORKTREE] Failed to delete branch {branch_name}: {delete.stderr.strip()}", file=sys.stderr)
+        else:
+            print(f"[WORKTREE] Deleted branch {branch_name}")
+
+
+def _handle_worktree_turn_exit(task_id: str, worktree_path: Path, branch_name: str,
+                               cwd: Path, auto_merge: bool, code: int):
+    """Finalize worktree lifecycle after an isolated turn exits."""
+    if code == 0:
+        if auto_merge:
+            merge_and_remove_worktree(task_id, worktree_path, branch_name, cwd)
+        else:
+            print(f"[WORKTREE] Turn passed. Kept worktree without merging: {worktree_path} (branch {branch_name})")
+    elif code == 10:
+        print(f"[WORKTREE] Kept for resumption: {worktree_path} (branch {branch_name})")
+    else:
+        subprocess.run(
+            ["git", "worktree", "remove", "--force", str(worktree_path)],
+            cwd=cwd, capture_output=True, text=True
+        )
+        print(f"[WORKTREE] Removed worktree after failure; branch {branch_name} kept")
 
 
 def merge_and_remove_worktree(task_id: str, worktree_path: Path, branch_name: str,
@@ -1077,40 +1281,42 @@ def merge_and_remove_worktree(task_id: str, worktree_path: Path, branch_name: st
         print(f"[WORKTREE] Removed worktree: {worktree_path}")
     if not auto_merge:
         return
-
-    with with_git_lock(cwd):
-        auto_rebase_branch_if_needed(branch_name, cwd)
-        merge = subprocess.run(
-            ["git", "merge", "--no-edit", branch_name],
-            cwd=cwd, capture_output=True, text=True
-        )
-        if merge.returncode != 0:
-            print(f"[WORKTREE] Merge failed: {merge.stderr.strip()}", file=sys.stderr)
-            print("[STATUS] MERGE_FAILED", file=sys.stderr)
-            sys.exit(15)
-        print(f"[WORKTREE] Merged {branch_name} into current branch")
-        delete = subprocess.run(
-            ["git", "branch", "-D", branch_name],
-            cwd=cwd, capture_output=True, text=True
-        )
-        if delete.returncode != 0:
-            print(f"[WORKTREE] Failed to delete branch {branch_name}: {delete.stderr.strip()}", file=sys.stderr)
+    _merge_branch_under_lock(branch_name, cwd)
 
 
 def merge_worktree_task(task_id: str, cwd: Path):
     """Explicitly merge and cleanup an isolated task worktree under mutex protection."""
+    try:
+        validate_task_id(task_id)
+    except ValueError as e:
+        print(f"[ERROR] Security violation: {e}", file=sys.stderr)
+        sys.exit(12)
+
     # Strict safety merge guard (exit 5)
     state_path = get_session_dir(task_id, cwd) / "state.json"
     if state_path.exists():
         try:
             guard_state = json.loads(state_path.read_text() or "{}")
-        except Exception:
-            guard_state = {}
+            if not isinstance(guard_state, dict):
+                raise ValueError("state.json must be a JSON object")
+        except Exception as e:
+            print(
+                f"[ERROR] Cannot merge worktree for task '{task_id}': corrupt state.json ({e}).",
+                file=sys.stderr,
+            )
+            sys.exit(5)
         status = (guard_state.get("status") or "").upper()
         if status.startswith("AWAITING_"):
             print(
                 f"[ERROR] Cannot merge worktree for task '{task_id}': status={status}. "
                 f"Resolve the pending question via 'reply --task-id {task_id} --answer ...' first.",
+                file=sys.stderr,
+            )
+            sys.exit(5)
+        if status in ("RUNNING", "FAILED"):
+            print(
+                f"[ERROR] Cannot merge worktree for task '{task_id}': status={status}. "
+                f"Only completed sessions can be merged.",
                 file=sys.stderr,
             )
             sys.exit(5)
@@ -1123,21 +1329,7 @@ def merge_worktree_task(task_id: str, cwd: Path):
             ["git", "worktree", "remove", "--force", str(worktree_path)],
             cwd=cwd, capture_output=True, text=True
         )
-    with with_git_lock(cwd):
-        auto_rebase_branch_if_needed(branch_name, cwd)
-        merge = subprocess.run(
-            ["git", "merge", "--no-edit", branch_name],
-            cwd=cwd, capture_output=True, text=True
-        )
-        if merge.returncode != 0:
-            print(f"[ERROR] Merge failed: {merge.stderr.strip()}", file=sys.stderr)
-            sys.exit(15)
-        print(f"[WORKTREE] Successfully merged {branch_name} into current branch")
-        subprocess.run(
-            ["git", "branch", "-D", branch_name],
-            cwd=cwd, capture_output=True, text=True
-        )
-        print(f"[WORKTREE] Deleted branch {branch_name}")
+    _merge_branch_under_lock(branch_name, cwd)
 
 
 def detect_lint_cmd(files: list[str], user_lint_cmd: str = None):
@@ -1218,13 +1410,19 @@ def run_turn(task_id: str, message: str, files: list[str], cwd: Path,
              verbose: bool = False, thinking: str = "auto",
              reasoning_effort: str = None, map_tokens: int = 0,
              plan_align: bool = False, session_root: Path = None,
-             tier: str = None):
+             tier: str = None, _is_suppress_retry: bool = False):
+    try:
+        validate_task_id(task_id)
+    except ValueError as e:
+        print(f"[ERROR] Security violation: {e}", file=sys.stderr)
+        sys.exit(12)
+
     session_root = session_root or cwd
 
     if worktree:
         worktree_path, branch_name = create_task_worktree(task_id, cwd)
         env_src = cwd / ".env"
-        if env_src.exists():
+        if env_src.exists() and not _is_git_tracked(worktree_path, ".env"):
             shutil.copy(env_src, worktree_path / ".env")
         try:
             run_turn(task_id, message, files, worktree_path,
@@ -1237,29 +1435,20 @@ def run_turn(task_id: str, message: str, files: list[str], cwd: Path,
                      session_root=session_root, tier=tier)
         except SystemExit as e:
             code = e.code if isinstance(e.code, int) else (0 if e.code is None else 1)
-            if code == 0:
-                if auto_merge:
-                    merge_and_remove_worktree(task_id, worktree_path, branch_name, cwd)
-                else:
-                    print(f"[WORKTREE] Turn passed. Kept worktree without merging: {worktree_path} (branch {branch_name})")
-            elif code == 10:
-                print(f"[WORKTREE] Kept for resumption: {worktree_path} (branch {branch_name})")
-            else:
-                subprocess.run(
-                    ["git", "worktree", "remove", "--force", str(worktree_path)],
-                    cwd=cwd, capture_output=True, text=True
-                )
-                print(f"[WORKTREE] Removed worktree after failure; branch {branch_name} kept")
+            _handle_worktree_turn_exit(task_id, worktree_path, branch_name, cwd, auto_merge, code)
             raise
     # Path containment validation first (security guard)
+    cwd_resolved = cwd.resolve()
     for f in (files or []) + (read_files or []):
         resolved = (cwd / f).resolve()
-        if not str(resolved).startswith(str(cwd.resolve())):
+        if resolved == cwd_resolved or not resolved.is_relative_to(cwd_resolved):
             print(f"[ERROR] Security violation: path '{f}' is outside project root!", file=sys.stderr)
             sys.exit(12)
             
     run_preflight_checks(read_files, cwd)
     load_project_env(cwd)
+    if session_root != cwd:
+        load_project_env(session_root)
     
     if not os.environ.get("DEEPSEEK_API_KEY"):
         print("[ERROR] DEEPSEEK_API_KEY not found in project .env file!", file=sys.stderr)
@@ -1314,7 +1503,7 @@ def run_turn(task_id: str, message: str, files: list[str], cwd: Path,
     state["last_cache_ping_ts"] = int(time.time())
     state["suppressed_count"] = int(state.get("suppressed_count", 0))
     state.setdefault("pending_qid", None)
-    state_file.write_text(json.dumps(state, indent=2))
+    _write_state_atomic(state_file, state)
 
     session_file = session_dir / "chat_history.md"
 
@@ -1396,11 +1585,13 @@ def run_turn(task_id: str, message: str, files: list[str], cwd: Path,
         if test_cmd:
             cmd.extend(["--auto-test", "--test-cmd", test_cmd])
 
-    # DeepSeek dynamic thinking / reasoning controls
-    if thinking == "off":
-        cmd.extend(["--thinking-tokens", "0"])
-    if reasoning_effort:
-        cmd.extend(["--reasoning-effort", reasoning_effort])
+    # DeepSeek dynamic thinking / reasoning controls are injected via ephemeral YAML
+    # extra_params; only pass CLI flags when no model-settings YAML was generated.
+    if not model_settings_path:
+        if thinking == "off":
+            cmd.extend(["--thinking-tokens", "0"])
+        if reasoning_effort:
+            cmd.extend(["--reasoning-effort", reasoning_effort])
 
     # Dry-run: propose diffs without writing to disk
     if dry_run:
@@ -1438,8 +1629,8 @@ def run_turn(task_id: str, message: str, files: list[str], cwd: Path,
     except Exception as e:
         rollback_target_files(files, cwd)
         state["status"] = "FAILED"
-        state_file.write_text(json.dumps(state, indent=2))
-        print(f"[ERROR] Aider invocation failed: {e}", file=sys.stderr)
+        _write_state_atomic(state_file, state)
+        print(f"[ERROR] Aider invocation failed: {_sanitize_secret(str(e))}", file=sys.stderr)
         print("[STATUS] AIDER_INVOCATION_FAILED")
         sys.exit(13)
     finally:
@@ -1489,27 +1680,34 @@ def run_turn(task_id: str, message: str, files: list[str], cwd: Path,
                     rec["suppressed"] = True
                     fh.write(json.dumps(rec) + "\n")
             state["suppressed_count"] = int(state.get("suppressed_count", 0)) + len(events)
-            retry_count = int(state.get("_auto_suppress_retry", 0))
-            if retry_count < 1:
-                state["_auto_suppress_retry"] = retry_count + 1
-                state_file.write_text(json.dumps(state, indent=2))
+            if not _is_suppress_retry:
+                _write_state_atomic(state_file, state)
                 print(
                     f"[THRESHOLD] Suppressed {len(events)} trivial question(s); auto-replying locally.",
                     file=sys.stderr,
                 )
+                if plan_align:
+                    retry_msg = (
+                        "STAGE 1: PLANNING ONLY. Do NOT edit or modify any files. "
+                        "Summarize your proposed architectural plan or ask a concrete [STAGE: PLANNING] "
+                        "question with [OPTIONS: ...] without conversational sign-off."
+                    )
+                else:
+                    retry_msg = "Follow repo conventions and finalize code without conversational sign-off."
                 run_turn(
                     task_id,
-                    "Follow repo conventions and finalize code without conversational sign-off.",
+                    retry_msg,
                     files, cwd, read_files=read_files, restore=True, model=model,
                     lint_cmd=lint_cmd, test_cmd=test_cmd, dry_run=dry_run,
                     architect=architect, editor_model=editor_model,
                     worktree=False, auto_merge=auto_merge, verbose=verbose,
                     thinking=thinking, reasoning_effort=reasoning_effort,
-                    map_tokens=map_tokens, plan_align=False,
+                    map_tokens=map_tokens, plan_align=plan_align,
                     session_root=session_root, tier=tier,
+                    _is_suppress_retry=True,
                 )
                 return
-            state_file.write_text(json.dumps(state, indent=2))
+            _write_state_atomic(state_file, state)
 
         if escalate_any:
             pending = next(ev for ev in events if ev["verdict"] == "ESCALATE_PRINCIPAL")
@@ -1523,7 +1721,7 @@ def run_turn(task_id: str, message: str, files: list[str], cwd: Path,
             new_stage = "PLANNING" if (plan_align or pending.get("stage") == "PLANNING") else "IMPLEMENTATION"
             state["stage"] = new_stage
             state["status"] = "AWAITING_PLAN_APPROVAL" if new_stage == "PLANNING" else "AWAITING_DECISION"
-            state_file.write_text(json.dumps(state, indent=2))
+            _write_state_atomic(state_file, state)
             print(f"\n[INTERCEPT] Sub-agent paused with {len(questions)} question(s):")
             for idx, q in enumerate(questions, 1):
                 print(f" {idx}. {q}")
@@ -1534,7 +1732,7 @@ def run_turn(task_id: str, message: str, files: list[str], cwd: Path,
     if not check_diff_applied_successfully(combined_output):
         rollback_target_files(files, cwd)
         state["status"] = "FAILED"
-        state_file.write_text(json.dumps(state, indent=2))
+        _write_state_atomic(state_file, state)
         print("[ERROR] Sub-agent search/replace edit failed to apply cleanly to disk!", file=sys.stderr)
         print("[STATUS] DIFF_APPLY_FAILED")
         sys.exit(11)
@@ -1542,18 +1740,23 @@ def run_turn(task_id: str, message: str, files: list[str], cwd: Path,
     if proc.returncode != 0:
         rollback_target_files(files, cwd)
         state["status"] = "FAILED"
-        state_file.write_text(json.dumps(state, indent=2))
+        _write_state_atomic(state_file, state)
         print(f"[ERROR] Aider exited with code {proc.returncode}", file=sys.stderr)
         sys.exit(proc.returncode)
         
     state["status"] = "COMPLETED"
     state["pending_qid"] = None
-    state_file.write_text(json.dumps(state, indent=2))
+    _write_state_atomic(state_file, state)
     print("[STATUS] COMPLETED")
     sys.exit(0)
 
 
 def cleanup_session(task_id: str, cwd: Path):
+    try:
+        validate_task_id(task_id)
+    except ValueError as e:
+        print(f"[ERROR] Security violation: {e}", file=sys.stderr)
+        sys.exit(12)
     session_dir = get_session_dir(task_id, cwd)
     if session_dir.exists():
         shutil.rmtree(session_dir, ignore_errors=True)
@@ -1572,6 +1775,11 @@ def cleanup_session(task_id: str, cwd: Path):
 
 def inspect_session(task_id: str, cwd: Path, as_json: bool = False):
     """Read session state + latest outbox event; exit 1 if state.json missing."""
+    try:
+        validate_task_id(task_id)
+    except ValueError as e:
+        print(f"[ERROR] Security violation: {e}", file=sys.stderr)
+        sys.exit(12)
     session_dir = get_session_dir(task_id, cwd)
     state_file = session_dir / "state.json"
     if not state_file.exists():
@@ -1613,6 +1821,12 @@ def inspect_session(task_id: str, cwd: Path, as_json: bool = False):
 def reply_session(task_id: str, answer: str, cwd: Path,
                   source: str = "architect", approved_option: str = None):
     """Append architect decision to inbox, then resume the session with --restore."""
+    try:
+        validate_task_id(task_id)
+    except ValueError as e:
+        print(f"[ERROR] Security violation: {e}", file=sys.stderr)
+        sys.exit(12)
+
     session_dir = get_session_dir(task_id, cwd)
     state_file = session_dir / "state.json"
     if not state_file.exists():
@@ -1620,12 +1834,25 @@ def reply_session(task_id: str, answer: str, cwd: Path,
         sys.exit(1)
     try:
         state = json.loads(state_file.read_text() or "{}")
+        if not isinstance(state, dict):
+            raise ValueError("state.json must be a JSON object")
     except Exception as e:
         print(f"[ERROR] Failed to parse state.json: {e}", file=sys.stderr)
         sys.exit(1)
 
+    status = (state.get("status") or "").upper()
+    if not status.startswith("AWAITING_"):
+        print(
+            f"[ERROR] Cannot reply to task '{task_id}': status={status or 'UNKNOWN'} "
+            f"(expected AWAITING_PLAN_APPROVAL or AWAITING_DECISION).",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    is_worktree = bool(state.get("worktree"))
     effective_cwd = cwd
-    if state.get("worktree"):
+    branch_name = state.get("branch") or f"task/{task_id}"
+    if is_worktree:
         wp_raw = state.get("worktree_path")
         wp = Path(wp_raw) if wp_raw else None
         if not wp or not wp.exists():
@@ -1655,36 +1882,43 @@ def reply_session(task_id: str, answer: str, cwd: Path,
     state["pending_qid"] = None
     if prior_stage == "PLANNING":
         state["stage"] = "IMPLEMENTATION"
-    state_file.write_text(json.dumps(state, indent=2))
+    _write_state_atomic(state_file, state)
 
     if approved_option:
         decision_msg = f"Architect Decision (Option {approved_option}): {answer}. Proceed with implementation."
     else:
         decision_msg = f"Architect Decision: {answer}. Proceed with implementation."
 
-    run_turn(
-        task_id,
-        decision_msg,
-        state.get("files") or [],
-        effective_cwd,
-        read_files=state.get("read_files") or [],
-        restore=True,
-        model=state.get("model") or "deepseek/deepseek-flash",
-        lint_cmd=state.get("lint_cmd"),
-        test_cmd=state.get("test_cmd"),
-        dry_run=False,
-        architect=bool(state.get("architect", False)),
-        editor_model=state.get("editor_model"),
-        worktree=False,
-        auto_merge=bool(state.get("auto_merge", True)),
-        verbose=False,
-        thinking=state.get("thinking") or "auto",
-        reasoning_effort=state.get("reasoning_effort"),
-        map_tokens=int(state.get("map_tokens", 0)),
-        plan_align=False,
-        session_root=cwd,
-        tier=state.get("tier"),
-    )
+    auto_merge = bool(state.get("auto_merge", True))
+    try:
+        run_turn(
+            task_id,
+            decision_msg,
+            state.get("files") or [],
+            effective_cwd,
+            read_files=state.get("read_files") or [],
+            restore=True,
+            model=state.get("model") or "deepseek/deepseek-flash",
+            lint_cmd=state.get("lint_cmd"),
+            test_cmd=state.get("test_cmd"),
+            dry_run=False,
+            architect=bool(state.get("architect", False)),
+            editor_model=state.get("editor_model"),
+            worktree=False,
+            auto_merge=auto_merge,
+            verbose=False,
+            thinking=state.get("thinking") or "auto",
+            reasoning_effort=state.get("reasoning_effort"),
+            map_tokens=int(state.get("map_tokens", 0)),
+            plan_align=False,
+            session_root=cwd,
+            tier=state.get("tier"),
+        )
+    except SystemExit as e:
+        if is_worktree:
+            code = e.code if isinstance(e.code, int) else (0 if e.code is None else 1)
+            _handle_worktree_turn_exit(task_id, effective_cwd, branch_name, cwd, auto_merge, code)
+        raise
 
 
 def main():

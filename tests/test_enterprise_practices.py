@@ -920,3 +920,213 @@ def test_parse_cost_and_tokens_architect_multi_call():
     assert rcvd == "500"
     assert cost_m == "0.00155"
     assert cost_s == "0.00155"
+
+
+def test_validate_task_id_blocks_traversal_and_unsafe_git_refs():
+    import pytest
+    bad_ids = ["", "   ", "../evil", "a/b", "a\\b", "-rf", ".hidden", "foo..bar", "task.lock", "bad;cmd"]
+    for bad in bad_ids:
+        with pytest.raises(ValueError):
+            aider_bridge.validate_task_id(bad)
+        with pytest.raises(ValueError):
+            aider_bridge.get_session_dir(bad, Path("/tmp"))
+        with pytest.raises(ValueError):
+            aider_bridge.create_task_worktree(bad, Path("/tmp"))
+        for fn in (
+            lambda b=bad: aider_bridge.run_turn(b, "m", [], Path("/tmp")),
+            lambda b=bad: aider_bridge.merge_worktree_task(b, Path("/tmp")),
+            lambda b=bad: aider_bridge.cleanup_session(b, Path("/tmp")),
+            lambda b=bad: aider_bridge.inspect_session(b, Path("/tmp")),
+            lambda b=bad: aider_bridge.reply_session(b, "ans", Path("/tmp")),
+        ):
+            with pytest.raises(SystemExit) as exc:
+                fn()
+            assert exc.value.code == 12
+
+
+def test_path_containment_blocks_sibling_prefix_bypass():
+    import pytest
+    with tempfile.TemporaryDirectory() as tmpdir:
+        base = Path(tmpdir)
+        proj = base / "proj"
+        sibling = base / "proj_evil"
+        proj.mkdir()
+        sibling.mkdir()
+        (sibling / "secret.py").write_text("SECRET = 1\n")
+
+        with pytest.raises(SystemExit) as exc:
+            aider_bridge.run_turn("sib_test", "m", ["../proj_evil/secret.py"], proj)
+        assert exc.value.code == 12
+
+        with pytest.raises(SystemExit) as exc2:
+            aider_bridge.run_turn("dot_test", "m", ["."], proj)
+        assert exc2.value.code == 12
+
+
+def test_with_git_lock_uses_git_common_dir_inside_worktree():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmppath = Path(tmpdir)
+        subprocess.run(["git", "init", "-b", "main"], cwd=tmppath, check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.name", "TestUser"], cwd=tmppath, check=True)
+        subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=tmppath, check=True)
+        (tmppath / "a.txt").write_text("1\n")
+        subprocess.run(["git", "add", "."], cwd=tmppath, check=True)
+        subprocess.run(["git", "commit", "-m", "init"], cwd=tmppath, check=True)
+
+        wt_path, _ = aider_bridge.create_task_worktree("lock_wt", tmppath)
+        expected_lock = (tmppath / ".git").resolve() / "aider_merge.lock.d"
+        with aider_bridge.with_git_lock(wt_path, timeout=1.0) as lock_dir:
+            assert lock_dir.resolve() == expected_lock
+            assert lock_dir.exists()
+        assert not expected_lock.exists()
+
+
+def test_auto_rebase_restores_base_branch_checkout_and_updates_main():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmppath = Path(tmpdir)
+        subprocess.run(["git", "init", "-b", "main"], cwd=tmppath, check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.name", "TestUser"], cwd=tmppath, check=True)
+        subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=tmppath, check=True)
+        (tmppath / "base.txt").write_text("v1\n")
+        subprocess.run(["git", "add", "."], cwd=tmppath, check=True)
+        subprocess.run(["git", "commit", "-m", "v1"], cwd=tmppath, check=True)
+
+        wt_a, branch_a = aider_bridge.create_task_worktree("rebase_fix", tmppath)
+        (wt_a / "feat.py").write_text("x = 1\n")
+        subprocess.run(["git", "add", "."], cwd=wt_a, check=True)
+        subprocess.run(["git", "commit", "-m", "feat"], cwd=wt_a, check=True)
+
+        # Advance main
+        (tmppath / "base.txt").write_text("v2\n")
+        subprocess.run(["git", "add", "."], cwd=tmppath, check=True)
+        subprocess.run(["git", "commit", "-m", "v2"], cwd=tmppath, check=True)
+
+        aider_bridge.merge_worktree_task("rebase_fix", tmppath)
+
+        head = subprocess.run(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            cwd=tmppath, capture_output=True, text=True, check=True,
+        )
+        assert head.stdout.strip() == "main"
+        branches = subprocess.run(
+            ["git", "branch", "--list", branch_a],
+            cwd=tmppath, capture_output=True, text=True, check=True,
+        )
+        assert branches.stdout.strip() == ""
+        assert (tmppath / "feat.py").read_text() == "x = 1\n"
+
+
+def test_merge_conflict_aborts_cleanly_on_exit_15():
+    import pytest
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmppath = Path(tmpdir)
+        subprocess.run(["git", "init", "-b", "main"], cwd=tmppath, check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.name", "TestUser"], cwd=tmppath, check=True)
+        subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=tmppath, check=True)
+        (tmppath / "shared.txt").write_text("line1\n")
+        subprocess.run(["git", "add", "."], cwd=tmppath, check=True)
+        subprocess.run(["git", "commit", "-m", "init"], cwd=tmppath, check=True)
+
+        wt_c, _ = aider_bridge.create_task_worktree("conflict_task", tmppath)
+        (wt_c / "shared.txt").write_text("from_task\n")
+        subprocess.run(["git", "add", "."], cwd=wt_c, check=True)
+        subprocess.run(["git", "commit", "-m", "task edit"], cwd=wt_c, check=True)
+
+        (tmppath / "shared.txt").write_text("from_main\n")
+        subprocess.run(["git", "add", "."], cwd=tmppath, check=True)
+        subprocess.run(["git", "commit", "-m", "main edit"], cwd=tmppath, check=True)
+
+        with pytest.raises(SystemExit) as exc:
+            aider_bridge.merge_worktree_task("conflict_task", tmppath)
+        assert exc.value.code == 15
+        # MERGE_HEAD must be aborted so repo is not left wedged
+        assert not (tmppath / ".git" / "MERGE_HEAD").exists()
+        head = subprocess.run(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            cwd=tmppath, capture_output=True, text=True, check=True,
+        )
+        assert head.stdout.strip() == "main"
+
+
+def test_merge_worktree_task_guards_running_failed_and_corrupt_state():
+    import pytest
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmppath = Path(tmpdir)
+        for status in ("RUNNING", "FAILED"):
+            tid = f"guard_{status}"
+            sd = tmppath / ".aider-sessions" / tid
+            sd.mkdir(parents=True)
+            (sd / "state.json").write_text(json.dumps({"status": status}))
+            with pytest.raises(SystemExit) as exc:
+                aider_bridge.merge_worktree_task(tid, tmppath)
+            assert exc.value.code == 5
+
+        sd_bad = tmppath / ".aider-sessions" / "guard_corrupt"
+        sd_bad.mkdir(parents=True)
+        (sd_bad / "state.json").write_text("{corrupt")
+        with pytest.raises(SystemExit) as exc:
+            aider_bridge.merge_worktree_task("guard_corrupt", tmppath)
+        assert exc.value.code == 5
+
+
+def test_commit_worktree_never_stages_tracked_or_untracked_env_and_aider_files():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmppath = Path(tmpdir)
+        subprocess.run(["git", "init", "-b", "main"], cwd=tmppath, check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.name", "TestUser"], cwd=tmppath, check=True)
+        subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=tmppath, check=True)
+        (tmppath / ".env").write_text("DEEPSEEK_API_KEY=placeholder\n")
+        (tmppath / "app.py").write_text("x = 1\n")
+        subprocess.run(["git", "add", "."], cwd=tmppath, check=True)
+        subprocess.run(["git", "commit", "-m", "init"], cwd=tmppath, check=True)
+
+        wt_path, _ = aider_bridge.create_task_worktree("env_guard", tmppath)
+        # Modify tracked .env, plus create untracked .env.local, .aider*, .aider-sessions/
+        (wt_path / ".env").write_text("DEEPSEEK_API_KEY=sk-REAL-SECRET-123456\n")
+        (wt_path / ".env.local").write_text("SECRET=xyz\n")
+        (wt_path / ".aider.model.settings.999.yml").write_text("secret\n")
+        (wt_path / ".aider-sessions" / "env_guard").mkdir(parents=True)
+        (wt_path / ".aider-sessions" / "env_guard" / "state.json").write_text("{}")
+        (wt_path / "app.py").write_text("x = 2\n")
+
+        aider_bridge.merge_worktree_task("env_guard", tmppath)
+        assert (tmppath / "app.py").read_text() == "x = 2\n"
+        assert (tmppath / ".env").read_text() == "DEEPSEEK_API_KEY=placeholder\n"
+        assert not (tmppath / ".env.local").exists()
+        assert not (tmppath / ".aider-sessions").exists()
+
+
+def test_load_project_env_export_quotes_and_error_secret_sanitization(monkeypatch, capsys):
+    import os
+    import pytest
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmppath = Path(tmpdir)
+        (tmppath / ".env").write_text(
+            'export DEEPSEEK_API_KEY="sk-live-secret-99999" # inline comment\n'
+            "SINGLE_QUOTED='abc''def'\n"
+            "MIXED_QUOTES=\"val'inner'\" # comment\n"
+            "UNQUOTED_COMMENT=rawval # trailing\n"
+        )
+        for k in ("DEEPSEEK_API_KEY", "SINGLE_QUOTED", "MIXED_QUOTES", "UNQUOTED_COMMENT"):
+            monkeypatch.delenv(k, raising=False)
+
+        aider_bridge.load_project_env(tmppath)
+        assert os.environ["DEEPSEEK_API_KEY"] == "sk-live-secret-99999"
+        assert os.environ["MIXED_QUOTES"] == "val'inner'"
+        assert os.environ["UNQUOTED_COMMENT"] == "rawval"
+
+        # Verify error sanitization redacts secret in run_search & fetch_account_balance
+        def boom_urlopen(req, timeout=None):
+            raise urllib.error.URLError("Bearer sk-live-secret-99999 failed")
+
+        monkeypatch.setattr(aider_bridge.urllib.request, "urlopen", boom_urlopen)
+        bal = aider_bridge.fetch_account_balance("sk-live-secret-99999")
+        assert "sk-live-secret-99999" not in bal["error"]
+        assert "[REDACTED]" in bal["error"]
+
+        with pytest.raises(SystemExit) as exc:
+            aider_bridge.run_search("query", tmppath)
+        assert exc.value.code == 18
+        err_out = capsys.readouterr().err
+        assert "sk-live-secret-99999" not in err_out
+        assert "[REDACTED]" in err_out

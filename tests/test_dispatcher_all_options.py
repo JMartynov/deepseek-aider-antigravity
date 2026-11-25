@@ -504,7 +504,7 @@ def test_cli_construction_tier1_patch(monkeypatch):
         assert cmd[cmd.index("--model") + 1] == "deepseek/deepseek-flash"
         assert cmd[cmd.index("--edit-format") + 1] == "diff"
         assert cmd[cmd.index("--map-tokens") + 1] == "0"
-        assert cmd[cmd.index("--thinking-tokens") + 1] == "0"
+        assert "--thinking-tokens" not in cmd
         assert "--cache-prompts" in cmd
         assert cmd[cmd.index("--cache-keepalive-pings") + 1] == "6"
         assert "--no-detect-urls" in cmd
@@ -549,11 +549,12 @@ def test_cli_construction_tier2_surgical_with_test_and_lint(monkeypatch):
             aider_bridge.main()
         assert exc.value.code == 0
 
-        cmd, _ = _extract_cmd_and_yaml(calls)
+        cmd, yaml_text = _extract_cmd_and_yaml(calls)
         assert cmd[cmd.index("--model") + 1] == "deepseek/deepseek-flash"
         assert cmd[cmd.index("--edit-format") + 1] == "diff"
         assert cmd[cmd.index("--map-tokens") + 1] == "512"
-        assert cmd[cmd.index("--reasoning-effort") + 1] == "low"
+        assert "--reasoning-effort" not in cmd
+        assert "reasoning_effort: low" in yaml_text
         assert "--auto-test" in cmd
         assert cmd[cmd.index("--test-cmd") + 1] == "pytest tests/test_auth.py -q"
         assert "--auto-lint" in cmd
@@ -595,7 +596,8 @@ def test_cli_construction_tier3_stage1_plan_align(monkeypatch):
         assert cmd[cmd.index("--model") + 1] == "deepseek/deepseek-reasoner"
         assert cmd[cmd.index("--chat-mode") + 1] == "ask"
         assert cmd[cmd.index("--map-tokens") + 1] == "512"
-        assert cmd[cmd.index("--reasoning-effort") + 1] == "high"
+        assert "--reasoning-effort" not in cmd
+        assert "reasoning_effort: high" in yaml_text
         assert "--edit-format" not in cmd
         assert "--architect" not in cmd
         assert "--editor-model" not in cmd
@@ -724,7 +726,8 @@ def test_cli_construction_turn_v4_pro_architect_auto_editor(monkeypatch):
         assert cmd[cmd.index("--model") + 1] == "deepseek/deepseek-v4-pro"
         assert "--architect" in cmd
         assert cmd[cmd.index("--editor-model") + 1] == "deepseek/deepseek-flash"
-        assert cmd[cmd.index("--reasoning-effort") + 1] == "max"
+        assert "--reasoning-effort" not in cmd
+        assert "reasoning_effort: max" in yaml_text
         assert cmd[cmd.index("--map-tokens") + 1] == "256"
         assert "--dry-run" in cmd
         assert "- name: deepseek/deepseek-v4-pro" in yaml_text
@@ -877,3 +880,29 @@ def test_run_turn_exit_codes_diff_fail_invocation_fail_and_missing_key(monkeypat
             aider_bridge.run_turn("k4", "msg", ["a.py"], tmppath)
         assert exc.value.code == 13
         assert json.loads((tmppath / ".aider-sessions" / "k4" / "state.json").read_text())["status"] == "FAILED"
+
+
+def test_cli_construction_non_deepseek_passes_thinking_and_reasoning_flags(monkeypatch):
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmppath = Path(tmpdir)
+        monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
+        calls = _mock_aider_subprocess(monkeypatch, stdout="Applied edit to app.py\n")
+
+        monkeypatch.setattr(sys, "argv", [
+            "aider_bridge.py", "turn",
+            "--task-id", "non_ds",
+            "--message", "Edit app",
+            "--files", "app.py",
+            "--model", "openai/o3-mini",
+            "--thinking", "off",
+            "--reasoning-effort", "low",
+            "--cwd", str(tmppath),
+        ])
+        with pytest.raises(SystemExit) as exc:
+            aider_bridge.main()
+        assert exc.value.code == 0
+
+        cmd, yaml_text = _extract_cmd_and_yaml(calls)
+        assert yaml_text is None
+        assert cmd[cmd.index("--thinking-tokens") + 1] == "0"
+        assert cmd[cmd.index("--reasoning-effort") + 1] == "low"

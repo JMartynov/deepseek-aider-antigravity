@@ -490,3 +490,180 @@ def test_reply_includes_approved_option_and_fails_on_missing_worktree(monkeypatc
         # State must remain intact when failing pre-flight
         state_after = json.loads((sd / "state.json").read_text())
         assert state_after["status"] == "AWAITING_PLAN_APPROVAL"
+
+
+def test_parse_structured_question_with_nested_brackets():
+    raw = (
+        "[STAGE: PLANNING] [CATEGORY: API_CONTRACT] [IMPACT: HIGH]\n"
+        "Which return type should we expose?\n"
+        "[OPTIONS:\n"
+        "  A) Return dict[str, int]\n"
+        "  B) Return list[tuple[str, int]]\n"
+        "]\n"
+        "[RECOMMENDATION: Option A (dict[str, int])]"
+    )
+    ev = aider_bridge.parse_structured_question(raw, seq=11)
+    assert [(o["key"], o["summary"]) for o in ev["options"]] == [
+        ("A", "Return dict[str, int]"),
+        ("B", "Return list[tuple[str, int]]"),
+    ]
+    assert ev["recommendation"] == "Option A (dict[str, int])"
+    assert ev["question"] == "Which return type should we expose?"
+
+    # Inline single-line options containing nested brackets
+    inline = (
+        "Choose type?\n"
+        "[OPTIONS: A) dict[str, int] B) list[str]]\n"
+        "[RECOMMENDATION: dict[str, int]]"
+    )
+    ev2 = aider_bridge.parse_structured_question(inline, seq=12)
+    assert [(o["key"], o["summary"]) for o in ev2["options"]] == [
+        ("A", "dict[str, int]"),
+        ("B", "list[str]"),
+    ]
+    assert ev2["recommendation"] == "dict[str, int]"
+
+    # Blank line inside [OPTIONS: ...] after dict[str, int] must not split the question
+    extracted = aider_bridge.extract_questions(
+        "QUESTION: Choose type?\n"
+        "[OPTIONS:\n"
+        "  A) dict[str, int]\n"
+        "\n"
+        "  B) list[str]\n"
+        "]\n"
+    )
+    assert len(extracted) == 1
+    assert "B) list[str]" in extracted[0]
+
+
+def test_plan_align_auto_suppress_retry_stays_in_planning_mode(monkeypatch):
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmppath = Path(tmpdir)
+        monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
+        calls = []
+
+        def mock_run(cmd, cwd=None, capture_output=True, text=True):
+            class Ret:
+                returncode = 0
+                stderr = ""
+            if cmd and cmd[0] == "uvx":
+                calls.append(list(cmd))
+                if "--chat-history-file" in cmd:
+                    ch = Path(cmd[cmd.index("--chat-history-file") + 1])
+                    ch.parent.mkdir(parents=True, exist_ok=True)
+                    ch.touch()
+                if len(calls) == 1:
+                    Ret.stdout = "QUESTION: Should I proceed?\n"
+                else:
+                    Ret.stdout = (
+                        "QUESTION: [STAGE: PLANNING] [CATEGORY: ARCHITECTURE] [IMPACT: HIGH]\n"
+                        "Pick storage?\n"
+                        "[OPTIONS:\n  A) SQLite\n  B) JSON\n]\n"
+                    )
+            else:
+                Ret.stdout = ""
+            return Ret()
+
+        monkeypatch.setattr(aider_bridge.subprocess, "run", mock_run)
+        monkeypatch.setattr(aider_bridge, "fetch_account_balance", lambda *a, **k: None)
+        with pytest.raises(SystemExit) as exc:
+            aider_bridge.run_turn(
+                "plan_sup", "Plan backend", ["app.py"], tmppath,
+                architect=True, plan_align=True,
+            )
+        assert exc.value.code == 10
+        assert len(calls) == 2
+        retry_cmd = calls[1]
+        assert "--chat-mode" in retry_cmd
+        assert retry_cmd[retry_cmd.index("--chat-mode") + 1] == "ask"
+        assert "--architect" not in retry_cmd
+        retry_msg = retry_cmd[retry_cmd.index("--message") + 1]
+        assert "PLANNING ONLY" in retry_msg
+        assert "finalize code" not in retry_msg
+
+
+def test_reply_session_rejects_non_awaiting_and_corrupt_state():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmppath = Path(tmpdir)
+        for bad_status in ("COMPLETED", "RUNNING", "FAILED"):
+            tid = f"bad_{bad_status}"
+            sd = tmppath / ".aider-sessions" / tid
+            sd.mkdir(parents=True)
+            (sd / "state.json").write_text(json.dumps({"task_id": tid, "status": bad_status}))
+            with pytest.raises(SystemExit) as exc:
+                aider_bridge.reply_session(tid, "Proceed", tmppath)
+            assert exc.value.code == 1
+
+        sd_corrupt = tmppath / ".aider-sessions" / "corrupt_state"
+        sd_corrupt.mkdir(parents=True)
+        (sd_corrupt / "state.json").write_text("{not-json")
+        with pytest.raises(SystemExit) as exc:
+            aider_bridge.reply_session("corrupt_state", "Proceed", tmppath)
+        assert exc.value.code == 1
+
+
+def test_reply_session_worktree_auto_merge_on_completion(monkeypatch):
+    import subprocess
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmppath = Path(tmpdir)
+        subprocess.run(["git", "init", "-b", "main"], cwd=tmppath, check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.name", "TestUser"], cwd=tmppath, check=True)
+        subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=tmppath, check=True)
+        (tmppath / "app.py").write_text("VAL = 0\n")
+        subprocess.run(["git", "add", "."], cwd=tmppath, check=True)
+        subprocess.run(["git", "commit", "-m", "Init"], cwd=tmppath, check=True)
+
+        monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
+        monkeypatch.setattr(aider_bridge, "fetch_account_balance", lambda *a, **k: None)
+
+        real_run = subprocess.run
+        turn_phase = {"n": 0}
+
+        def mock_run(cmd, cwd=None, capture_output=True, text=True):
+            if cmd and cmd[0] == "uvx":
+                turn_phase["n"] += 1
+                if "--chat-history-file" in cmd:
+                    ch = Path(cmd[cmd.index("--chat-history-file") + 1])
+                    ch.parent.mkdir(parents=True, exist_ok=True)
+                    ch.touch()
+                class Ret:
+                    returncode = 0
+                    stderr = ""
+                if turn_phase["n"] == 1:
+                    Ret.stdout = (
+                        "QUESTION: [STAGE: PLANNING] [CATEGORY: ARCHITECTURE] [IMPACT: HIGH]\n"
+                        "Pick value?\n"
+                    )
+                else:
+                    # Simulate Aider editing app.py inside the worktree
+                    (Path(cwd) / "app.py").write_text("VAL = 99\n")
+                    Ret.stdout = "Applied edit to app.py\n"
+                return Ret()
+            return real_run(cmd, cwd=cwd, capture_output=capture_output, text=text)
+
+        monkeypatch.setattr(aider_bridge.subprocess, "run", mock_run)
+
+        # Turn 1: pauses in worktree with exit 10
+        with pytest.raises(SystemExit) as exc1:
+            aider_bridge.run_turn(
+                "wt_reply", "Update VAL", ["app.py"], tmppath,
+                worktree=True, auto_merge=True, plan_align=True,
+            )
+        assert exc1.value.code == 10
+        wt_path = tmppath / ".worktrees" / "wt_reply"
+        assert wt_path.exists()
+
+        # Turn 2: reply completes with exit 0 -> auto_merge=True merges and removes worktree
+        with pytest.raises(SystemExit) as exc2:
+            aider_bridge.reply_session("wt_reply", "Use 99", tmppath, approved_option="A")
+        assert exc2.value.code == 0
+        assert not wt_path.exists()
+        assert (tmppath / "app.py").read_text() == "VAL = 99\n"
+
+
+def test_atomic_state_json_write_no_tmp_leftover():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        sf = Path(tmpdir) / "sess" / "state.json"
+        aider_bridge._write_state_atomic(sf, {"task_id": "t", "status": "RUNNING"})
+        assert json.loads(sf.read_text()) == {"task_id": "t", "status": "RUNNING"}
+        assert not list(sf.parent.glob(".state.*.tmp"))
