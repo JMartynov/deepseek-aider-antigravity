@@ -171,6 +171,31 @@ python3 scripts/aider_bridge.py search --cwd "<project_dir>" \
 
 Feed the resulting summary/URLs back into your task prompt or `--read-files` contract. Exit codes: `16` (429 rate limit), `17` (API error), `18` (network), `19` (invalid response).
 
+### Smart Dispatcher (Auto Tier Routing)
+
+The `dispatch` subcommand classifies a task and selects the optimal model / thinking / edit-format automatically:
+
+```bash
+# Dry-run: print the classification verdict + resolved parameters (no execution)
+python3 scripts/aider_bridge.py dispatch \
+  --task-id "<task_id>" --message "Fix typo in README" --files README.md \
+  --dry-run --cwd "<project_dir>"
+
+# Execute the matched tier
+python3 scripts/aider_bridge.py dispatch \
+  --task-id "<task_id>" --message "Implement verify_token" --files auth.py \
+  --test-cmd "uv run pytest tests/test_auth.py -q" --worktree --cwd "<project_dir>"
+```
+
+| Tier | Label | Trigger | Model / Thinking | Test-Cmd |
+| :---: | :--- | :--- | :--- | :--- |
+| 1 | `PATCH` | 1 doc/config file or patch keywords (typo, lint, bump, version, docstring, comment, readme, format, rename); no `--test-cmd` | `deepseek-flash` / `off` | off |
+| 2 | `SURGICAL` | 1–3 domain files, localized work, or active `--test-cmd` | `deepseek-flash` / `auto` (low) | active |
+| 3 | `ARCHITECT` | >3 files or complex/AST/concurrency keywords | `deepseek-reasoner` + `flash` editor / `on` (high) | active |
+| 4 | `RESEARCH` | No editable files with research intent, or no `--test-cmd` | DeepSeek `search` API | n/a |
+
+Flags: `--tier {auto,patch,surgical,architect,research}`, `--thinking {auto,on,off}`, `--reasoning-effort {low,high,max}`, `--dry-run`, `--worktree`, `--no-auto-merge`, `-v/--verbose`.
+
 ---
 
 ## 🏛️ Architecture & Division of Labor

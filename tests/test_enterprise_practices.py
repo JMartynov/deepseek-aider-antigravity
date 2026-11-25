@@ -349,6 +349,236 @@ def test_architect_argument_wiring(monkeypatch):
         assert cmd[idx + 1] == "custom/editor"
 
 
+# ---------------------------------------------------------------------------
+# Smart DeepSeek Classifier & Dispatcher
+# ---------------------------------------------------------------------------
+
+def test_classify_task_tier1_patch():
+    tier, reason, params = aider_bridge.classify_task(
+        "Fix typo in the README", files=["README.md"])
+    assert tier == "patch"
+    assert params["tier_num"] == 1
+    assert params["tier_label"] == "PATCH"
+    assert params["model"] == "deepseek/deepseek-flash"
+    assert params["thinking"] == "off"
+    assert params["reasoning_effort"] is None
+    assert params["edit_format"] == "diff"
+    assert params["map_tokens"] == 0
+    assert params["architect"] is False
+    assert params["editor_model"] is None
+
+
+def test_classify_task_tier1_patch_by_extension():
+    tier, reason, params = aider_bridge.classify_task(
+        "Update the config", files=["pyproject.toml"])
+    assert tier == "patch"
+    assert params["tier_num"] == 1
+
+
+def test_classify_task_tier2_surgical():
+    tier, reason, params = aider_bridge.classify_task(
+        "Implement verify_token", files=["auth.py"],
+        test_cmd="pytest tests/test_auth.py -q")
+    assert tier == "surgical"
+    assert params["tier_num"] == 2
+    assert params["tier_label"] == "SURGICAL"
+    assert params["model"] == "deepseek/deepseek-flash"
+    assert params["thinking"] == "auto"
+    assert params["reasoning_effort"] == "low"
+    assert params["map_tokens"] == 512
+    assert params["architect"] is False
+    assert params["test_cmd"] == "pytest tests/test_auth.py -q"
+
+
+def test_classify_task_tier2_surgical_no_test_cmd():
+    tier, reason, params = aider_bridge.classify_task(
+        "Fix bug in the parser", files=["parser.py"])
+    assert tier == "surgical"
+    assert params["tier_num"] == 2
+
+
+def test_classify_task_tier3_architect_by_file_count():
+    tier, reason, params = aider_bridge.classify_task(
+        "Implement feature", files=["a.py", "b.py", "c.py", "d.py"])
+    assert tier == "architect"
+    assert params["tier_num"] == 3
+    assert params["tier_label"] == "ARCHITECT"
+    assert params["model"] == "deepseek/deepseek-reasoner"
+    assert params["thinking"] == "on"
+    assert params["reasoning_effort"] == "high"
+    assert params["map_tokens"] == 512
+    assert params["architect"] is True
+    assert params["editor_model"] == "deepseek/deepseek-flash"
+
+
+def test_classify_task_tier3_architect_by_keyword():
+    tier, reason, params = aider_bridge.classify_task(
+        "Refactor the sqlglot visitor", files=["visitors.py"])
+    assert tier == "architect"
+    assert params["tier_num"] == 3
+
+
+def test_classify_task_tier4_research_no_files():
+    tier, reason, params = aider_bridge.classify_task("What is PEP 695?")
+    assert tier == "research"
+    assert params["tier_num"] == 4
+    assert params["tier_label"] == "RESEARCH"
+    assert params["command"] == "search"
+    assert params["query"] == "What is PEP 695?"
+    assert params["model"] is None
+    assert params["test_cmd"] is None
+
+
+def test_classify_task_tier4_research_query_truncated():
+    long_msg = "research " + ("x" * 300)
+    tier, reason, params = aider_bridge.classify_task(long_msg)
+    assert tier == "research"
+    assert len(params["query"]) == 128
+
+
+def test_classify_task_manual_override():
+    tier, reason, params = aider_bridge.classify_task(
+        "Refactor everything", files=["a.py", "b.py", "c.py", "d.py"],
+        forced_tier="patch")
+    assert tier == "patch"
+    assert "manual override" in reason
+    assert params["tier_num"] == 1
+
+    tier, reason, params = aider_bridge.classify_task(
+        "typo", files=["README.md"], forced_tier="architect")
+    assert tier == "architect"
+    assert params["tier_num"] == 3
+
+
+def test_classify_task_invalid_forced_tier():
+    import pytest
+    with pytest.raises(ValueError):
+        aider_bridge.classify_task("msg", forced_tier="bogus")
+
+
+def test_ephemeral_settings_architect_primary_and_editor():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmppath = Path(tmpdir)
+        path = aider_bridge.create_ephemeral_model_settings(
+            tmppath, "deepseek/deepseek-reasoner",
+            editor_model="deepseek/deepseek-flash", architect=True,
+            thinking="on", reasoning_effort="high")
+        assert path is not None
+        content = path.read_text()
+        assert "- name: deepseek/deepseek-reasoner" in content
+        assert "edit_format: diff" in content
+        assert "caches_by_default: true" in content
+        assert "examples_as_sys_msg: true" in content
+        assert "type: enabled" in content
+        assert "reasoning_effort: high" in content
+        assert "- name: deepseek/deepseek-flash" in content
+        assert "edit_format: editor-diff" in content
+        assert "type: disabled" in content
+
+
+def test_ephemeral_settings_thinking_off():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmppath = Path(tmpdir)
+        path = aider_bridge.create_ephemeral_model_settings(
+            tmppath, "deepseek/deepseek-flash", thinking="off")
+        assert path is not None
+        content = path.read_text()
+        assert "type: disabled" in content
+        assert "type: enabled" not in content
+
+
+def test_dispatch_dry_run_patch(monkeypatch, capsys):
+    import pytest
+    called = {"run": False}
+
+    def boom(*a, **k):
+        called["run"] = True
+        raise AssertionError("run_turn/run_search must not run under --dry-run")
+
+    monkeypatch.setattr(aider_bridge, "run_turn", boom)
+    monkeypatch.setattr(aider_bridge, "run_search", boom)
+    monkeypatch.setattr(sys, "argv", [
+        "aider_bridge.py", "dispatch", "--task-id", "d1",
+        "--message", "Fix typo in docs", "--files", "README.md",
+        "--tier", "auto", "--dry-run", "--cwd", ".",
+    ])
+    with pytest.raises(SystemExit) as exc:
+        aider_bridge.main()
+    assert exc.value.code == 0
+    out = capsys.readouterr().out
+    assert "[DISPATCHER] Classified as TIER 1: PATCH" in out
+    assert "model: deepseek/deepseek-flash" in out
+    assert "thinking: off" in out
+    assert "map_tokens: 0" in out
+    assert called["run"] is False
+
+
+def test_dispatch_routes_to_run_turn(monkeypatch):
+    captured = {}
+
+    def fake_run_turn(task_id, message, files, cwd, **kwargs):
+        captured["task_id"] = task_id
+        captured["files"] = list(files)
+        captured["kwargs"] = kwargs
+
+    monkeypatch.setattr(aider_bridge, "run_turn", fake_run_turn)
+    monkeypatch.setattr(sys, "argv", [
+        "aider_bridge.py", "dispatch", "--task-id", "d2",
+        "--message", "Implement verify_token", "--files", "auth.py",
+        "--test-cmd", "pytest tests/test_auth.py -q", "--cwd", ".",
+    ])
+    aider_bridge.main()
+
+    assert captured["task_id"] == "d2"
+    assert captured["files"] == ["auth.py"]
+    kw = captured["kwargs"]
+    assert kw["test_cmd"] == "pytest tests/test_auth.py -q"
+    assert kw["model"] == "deepseek/deepseek-flash"
+    assert kw["thinking"] == "auto"
+    assert kw["map_tokens"] == 512
+    assert kw["architect"] is False
+
+
+def test_dispatch_applies_thinking_override(monkeypatch):
+    captured = {}
+
+    def fake_run_turn(task_id, message, files, cwd, **kwargs):
+        captured.update(kwargs)
+
+    monkeypatch.setattr(aider_bridge, "run_turn", fake_run_turn)
+    monkeypatch.setattr(sys, "argv", [
+        "aider_bridge.py", "dispatch", "--task-id", "d4",
+        "--message", "Fix typo", "--files", "README.md",
+        "--thinking", "on", "--reasoning-effort", "high", "--cwd", ".",
+    ])
+    aider_bridge.main()
+
+    assert captured["thinking"] == "on"
+    assert captured["reasoning_effort"] == "high"
+
+
+def test_dispatch_routes_research_to_search(monkeypatch):
+    captured = {}
+
+    def fake_run_search(query, cwd, **kwargs):
+        captured["query"] = query
+
+    monkeypatch.setattr(aider_bridge, "run_search", fake_run_search)
+    monkeypatch.setattr(sys, "argv", [
+        "aider_bridge.py", "dispatch", "--task-id", "d3",
+        "--message", "What is PEP 695?", "--cwd", ".",
+    ])
+    aider_bridge.main()
+
+    assert captured["query"] == "What is PEP 695?"
+
+
+def test_classify_task_word_boundary_prevents_ast_false_positive():
+    tier, _, _ = aider_bridge.classify_task(
+        "Fix bug in fast parser", files=["parser.py"])
+    assert tier == "surgical"
+
+
 def test_search_default_post_request(monkeypatch):
     captured = {}
 

@@ -193,6 +193,190 @@ def format_search_results(data: dict, need_content: bool = False) -> str:
     return "\n".join(lines)
 
 
+SUPPORTED_TIERS = ("patch", "surgical", "architect", "research")
+
+RESEARCH_KEYWORDS = (
+    "research", "search", "lookup", "look up", "pep", "cve", "advisory",
+    "spec", "what is", "how does", "documentation",
+)
+ARCHITECT_KEYWORDS = (
+    "architect", "refactor", "ast", "visitor", "sqlglot", "security guard",
+    "security_guard", "concurrency", "mutex", "lock", "cross-module",
+    "cross-repo", "redesign", "rewrite", "migrate",
+)
+PATCH_KEYWORDS = (
+    "typo", "lint", "linter", "bump", "version", "docstring", "comment",
+    "readme", "format", "rename",
+)
+DOC_CONFIG_EXTENSIONS = (
+    ".md", ".txt", ".rst", ".toml", ".yaml", ".yml", ".json", ".ini", ".cfg",
+)
+
+
+def _resolve_tier_params(tier: str, test_cmd: str = None, message: str = "") -> dict:
+    """Build the resolved Aider/search parameter dict for a given precision tier."""
+    if tier == "patch":
+        return {
+            "tier_num": 1,
+            "tier_label": "PATCH",
+            "model": "deepseek/deepseek-flash",
+            "thinking": "off",
+            "reasoning_effort": None,
+            "edit_format": "diff",
+            "map_tokens": 0,
+            "architect": False,
+            "editor_model": None,
+            "test_cmd": test_cmd,
+        }
+    if tier == "surgical":
+        return {
+            "tier_num": 2,
+            "tier_label": "SURGICAL",
+            "model": "deepseek/deepseek-flash",
+            "thinking": "auto",
+            "reasoning_effort": "low",
+            "edit_format": "diff",
+            "map_tokens": 512,
+            "architect": False,
+            "editor_model": None,
+            "test_cmd": test_cmd,
+        }
+    if tier == "architect":
+        return {
+            "tier_num": 3,
+            "tier_label": "ARCHITECT",
+            "model": "deepseek/deepseek-reasoner",
+            "thinking": "on",
+            "reasoning_effort": "high",
+            "edit_format": "diff",
+            "map_tokens": 512,
+            "architect": True,
+            "editor_model": "deepseek/deepseek-flash",
+            "test_cmd": test_cmd,
+        }
+    return {
+        "tier_num": 4,
+        "tier_label": "RESEARCH",
+        "command": "search",
+        "query": (message or "").strip()[:128],
+        "model": None,
+        "thinking": "off",
+        "reasoning_effort": None,
+        "edit_format": None,
+        "map_tokens": 0,
+        "architect": False,
+        "editor_model": None,
+        "test_cmd": None,
+    }
+
+
+def _has_keyword(text: str, keywords: tuple[str, ...]) -> bool:
+    """Return True if any keyword matches as a whole word/phrase in text."""
+    return any(re.search(rf"\b{re.escape(kw)}\b", text) for kw in keywords)
+
+
+def classify_task(message: str, files: list[str] = None,
+                  read_files: list[str] = None, test_cmd: str = None,
+                  forced_tier: str = "auto") -> tuple[str, str, dict]:
+    """
+    Rule-engine that classifies a task into a precision tier and returns
+    (tier_name, reasoning, resolved_params).
+    """
+    files = list(files or [])
+    read_files = list(read_files or [])
+    msg = (message or "").lower()
+
+    if forced_tier and forced_tier.lower() != "auto":
+        tier = forced_tier.lower()
+        if tier not in SUPPORTED_TIERS:
+            raise ValueError(
+                f"Unsupported tier {forced_tier!r}; expected one of {SUPPORTED_TIERS} or 'auto'."
+            )
+        reason = f"manual override (--tier {tier})"
+        return tier, reason, _resolve_tier_params(tier, test_cmd=test_cmd, message=message)
+
+    # Tier 4: Research (no editable files + research intent or missing test contract)
+    if not files and (_has_keyword(msg, RESEARCH_KEYWORDS) or not test_cmd):
+        reason = "no editable files with research/lookup intent or no --test-cmd"
+        return "research", reason, _resolve_tier_params("research", message=message)
+
+    # Tier 3: Architect (many files or complex/AST/concurrency/security keywords)
+    if len(files) > 3 or _has_keyword(msg, ARCHITECT_KEYWORDS):
+        reason = f"{len(files)} target file(s) or complex/AST/architecture keywords"
+        return "architect", reason, _resolve_tier_params("architect", test_cmd=test_cmd, message=message)
+
+    # Tier 1: Quick patch (single doc/config file or mechanical keywords, no tests)
+    if len(files) == 1 and not test_cmd and (
+        str(files[0]).lower().endswith(DOC_CONFIG_EXTENSIONS)
+        or _has_keyword(msg, PATCH_KEYWORDS)
+    ):
+        reason = "single doc/config file or mechanical patch keywords"
+        return "patch", reason, _resolve_tier_params("patch", test_cmd=test_cmd, message=message)
+
+    # Tier 2: Surgical (default for 1-3 domain files / localized work / active tests)
+    reason = f"{len(files)} domain file(s)"
+    if test_cmd:
+        reason += " with active --test-cmd"
+    return "surgical", reason, _resolve_tier_params("surgical", test_cmd=test_cmd, message=message)
+
+
+def run_dispatch(task_id: str, message: str, files: list[str], cwd: Path,
+                 read_files: list[str] = None, test_cmd: str = None,
+                 tier: str = "auto", thinking: str = "auto",
+                 reasoning_effort: str = None, dry_run: bool = False,
+                 worktree: bool = False, auto_merge: bool = True,
+                 verbose: bool = False):
+    """
+    Classify a task into its optimal precision tier and dispatch it to the
+    matching model/thinking/edit-format configuration (or DeepSeek search).
+    """
+    tier_name, reasoning, resolved = classify_task(
+        message, files=files, read_files=read_files,
+        test_cmd=test_cmd, forced_tier=tier,
+    )
+
+    # Explicit CLI overrides win over tier defaults
+    if thinking and thinking != "auto":
+        resolved["thinking"] = thinking
+    if reasoning_effort:
+        resolved["reasoning_effort"] = reasoning_effort
+
+    print(
+        f"[DISPATCHER] Classified as TIER {resolved['tier_num']}: "
+        f"{resolved['tier_label']} (reason: {reasoning})"
+    )
+
+    if dry_run:
+        print(f"[DISPATCHER] Tier key: {tier_name}")
+        print("[DISPATCHER] Resolved parameters:")
+        for key in ("model", "thinking", "reasoning_effort", "edit_format",
+                    "map_tokens", "architect", "editor_model", "test_cmd",
+                    "command", "query"):
+            if key in resolved:
+                print(f"  {key}: {resolved[key]}")
+        print("[STATUS] DRY_RUN")
+        sys.exit(0)
+
+    if tier_name == "research":
+        run_search(resolved.get("query") or (message or ""), cwd)
+        return
+
+    run_turn(
+        task_id, message, files, cwd,
+        read_files=read_files, restore=False,
+        model=resolved.get("model") or "deepseek/deepseek-flash",
+        lint_cmd=None,
+        test_cmd=resolved.get("test_cmd"),
+        dry_run=False,
+        architect=resolved.get("architect", False),
+        editor_model=resolved.get("editor_model"),
+        worktree=worktree, auto_merge=auto_merge, verbose=verbose,
+        thinking=resolved.get("thinking", "auto"),
+        reasoning_effort=resolved.get("reasoning_effort"),
+        map_tokens=resolved.get("map_tokens", 0),
+    )
+
+
 def run_search(query: str, cwd: Path, count: int = 5,
                need_content: bool = False, as_json: bool = False):
     """CLI entry: validate, dispatch to DeepSeek search, map errors to exit codes."""
@@ -339,20 +523,51 @@ def remove_ephemeral_aiderignore(ignore_path: Path):
     remove_ephemeral_file(ignore_path)
 
 
-def create_ephemeral_model_settings(cwd: Path, model: str):
+def create_ephemeral_model_settings(cwd: Path, model: str, editor_model: str = None,
+                                    architect: bool = False, thinking: str = "auto",
+                                    reasoning_effort: str = None):
     """
     Ensure deepseek models (e.g. deepseek/deepseek-flash) have explicit
     caches_by_default=True and edit_format=diff configured in Aider settings.
+    Optionally emit an editor-model entry with editor-diff and thinking disabled.
     """
-    if not ("deepseek" in model.lower()):
-        return None
-    settings_path = cwd / f".aider.model.settings.{os.getpid()}.yml"
-    settings_yaml = (
-        f"- name: {model}\n"
-        f"  edit_format: diff\n"
-        f"  caches_by_default: true\n"
+    model_is_deepseek = bool(model) and "deepseek" in model.lower()
+    editor_is_deepseek = (
+        bool(editor_model)
+        and "deepseek" in editor_model.lower()
+        and editor_model != model
     )
-    settings_path.write_text(settings_yaml)
+    if not model_is_deepseek and not editor_is_deepseek:
+        return None
+
+    lines = []
+    if model_is_deepseek:
+        lines.append(f"- name: {model}")
+        lines.append("  edit_format: diff")
+        lines.append("  caches_by_default: true")
+        lines.append("  examples_as_sys_msg: true")
+        extra = []
+        if thinking == "off":
+            extra.append("    thinking:\n      type: disabled")
+        elif thinking == "on":
+            extra.append("    thinking:\n      type: enabled")
+        if reasoning_effort:
+            extra.append(f"    reasoning_effort: {reasoning_effort}")
+        if extra:
+            lines.append("  extra_params:")
+            lines.extend(extra)
+
+    if editor_is_deepseek:
+        lines.append(f"- name: {editor_model}")
+        lines.append("  edit_format: editor-diff")
+        lines.append("  caches_by_default: true")
+        lines.append("  examples_as_sys_msg: true")
+        lines.append("  extra_params:")
+        lines.append("    thinking:")
+        lines.append("      type: disabled")
+
+    settings_path = cwd / f".aider.model.settings.{os.getpid()}.yml"
+    settings_path.write_text("\n".join(lines) + "\n")
     return settings_path
 
 
@@ -596,7 +811,8 @@ def run_turn(task_id: str, message: str, files: list[str], cwd: Path,
              test_cmd: str = None, dry_run: bool = False,
              architect: bool = False, editor_model: str = None,
              worktree: bool = False, auto_merge: bool = True,
-             verbose: bool = False):
+             verbose: bool = False, thinking: str = "auto",
+             reasoning_effort: str = None, map_tokens: int = 0):
     if worktree:
         worktree_path, branch_name = create_task_worktree(task_id, cwd)
         env_src = cwd / ".env"
@@ -607,7 +823,9 @@ def run_turn(task_id: str, message: str, files: list[str], cwd: Path,
                      read_files=read_files, restore=restore, model=model,
                      lint_cmd=lint_cmd, test_cmd=test_cmd, dry_run=dry_run,
                      architect=architect, editor_model=editor_model,
-                     worktree=False, verbose=verbose)
+                     worktree=False, verbose=verbose,
+                     thinking=thinking, reasoning_effort=reasoning_effort,
+                     map_tokens=map_tokens)
         except SystemExit as e:
             code = e.code if isinstance(e.code, int) else (0 if e.code is None else 1)
             if code == 0:
@@ -660,7 +878,7 @@ def run_turn(task_id: str, message: str, files: list[str], cwd: Path,
         "--edit-format", "diff",
         "--cache-prompts",
         "--cache-keepalive-pings", "6",
-        "--map-tokens", "0",
+        "--map-tokens", str(map_tokens),
         "--no-analytics",
         "--no-check-update",
         "--no-show-release-notes",
@@ -676,8 +894,16 @@ def run_turn(task_id: str, message: str, files: list[str], cwd: Path,
     ignore_path = create_ephemeral_aiderignore(cwd)
     cmd.extend(["--aiderignore", str(ignore_path)])
 
+    # Resolve the architect editor model early so settings can include it
+    resolved_editor_model = editor_model
+    if architect and not resolved_editor_model and model == "deepseek/deepseek-reasoner":
+        resolved_editor_model = "deepseek/deepseek-flash"
+
     # Ephemeral model settings for explicit prompt caching and diff format
-    model_settings_path = create_ephemeral_model_settings(cwd, model)
+    model_settings_path = create_ephemeral_model_settings(
+        cwd, model, editor_model=resolved_editor_model,
+        architect=architect, thinking=thinking, reasoning_effort=reasoning_effort
+    )
     if model_settings_path:
         cmd.extend(["--model-settings-file", str(model_settings_path)])
 
@@ -690,16 +916,19 @@ def run_turn(task_id: str, message: str, files: list[str], cwd: Path,
     if test_cmd:
         cmd.extend(["--auto-test", "--test-cmd", test_cmd])
 
+    # DeepSeek dynamic thinking / reasoning controls
+    if thinking == "off":
+        cmd.extend(["--thinking-tokens", "0"])
+    if reasoning_effort:
+        cmd.extend(["--reasoning-effort", reasoning_effort])
+
     # Dry-run: propose diffs without writing to disk
     if dry_run:
         cmd.append("--dry-run")
 
     # Architect mode (two-model: architect + editor)
-    resolved_editor_model = editor_model
     if architect:
         cmd.append("--architect")
-        if not resolved_editor_model and model == "deepseek/deepseek-reasoner":
-            resolved_editor_model = "deepseek/deepseek-flash"
     if resolved_editor_model:
         cmd.extend(["--editor-model", resolved_editor_model])
     
@@ -812,7 +1041,25 @@ def main():
     turn_parser.add_argument("--worktree", action="store_true", help="Run the turn inside an isolated git worktree and branch")
     turn_parser.add_argument("--no-auto-merge", action="store_true", help="Do not auto-merge the worktree on turn completion")
     turn_parser.add_argument("-v", "--verbose", action="store_true", help="Include full thinking traces and raw startup banners in output")
+    turn_parser.add_argument("--thinking", default="auto", choices=["auto", "on", "off"], help="DeepSeek thinking mode (default: auto)")
+    turn_parser.add_argument("--reasoning-effort", default=None, choices=["low", "high", "max"], help="DeepSeek reasoning effort level")
+    turn_parser.add_argument("--map-tokens", type=int, default=0, help="Aider repo-map token budget (default: 0)")
     turn_parser.add_argument("--cwd", default=".", help="Project working directory")
+
+    dispatch_parser = subparsers.add_parser("dispatch", help="Auto-classify and dispatch a task to the optimal tier")
+    dispatch_parser.add_argument("--task-id", required=True, help="Unique identifier for the task session")
+    dispatch_parser.add_argument("--message", required=True, help="Task specification / research query")
+    dispatch_parser.add_argument("--files", nargs="*", default=[], help="Editable target files")
+    dispatch_parser.add_argument("--read-files", nargs="*", default=[], help="Read-only reference files")
+    dispatch_parser.add_argument("--test-cmd", default=None, help="Test command enabling closed-loop TDD")
+    dispatch_parser.add_argument("--tier", default="auto", choices=["auto", "patch", "surgical", "architect", "research"], help="Force a tier (default: auto)")
+    dispatch_parser.add_argument("--thinking", default="auto", choices=["auto", "on", "off"], help="Override thinking mode")
+    dispatch_parser.add_argument("--reasoning-effort", default=None, choices=["low", "high", "max"], help="Override reasoning effort")
+    dispatch_parser.add_argument("--dry-run", action="store_true", help="Print classification + resolved params without executing")
+    dispatch_parser.add_argument("--worktree", action="store_true", help="Run inside an isolated git worktree")
+    dispatch_parser.add_argument("--no-auto-merge", action="store_true", help="Do not auto-merge the worktree on completion")
+    dispatch_parser.add_argument("-v", "--verbose", action="store_true", help="Include full thinking traces in output")
+    dispatch_parser.add_argument("--cwd", default=".", help="Project working directory")
     
     clean_parser = subparsers.add_parser("cleanup", help="Clean up session history file")
     clean_parser.add_argument("--task-id", required=True, help="Task identifier to clean up")
@@ -844,7 +1091,16 @@ def main():
                  lint_cmd=args.lint_cmd, test_cmd=args.test_cmd,
                  dry_run=args.dry_run, architect=args.architect,
                  editor_model=args.editor_model, worktree=args.worktree,
-                 auto_merge=not args.no_auto_merge, verbose=args.verbose)
+                 auto_merge=not args.no_auto_merge, verbose=args.verbose,
+                 thinking=args.thinking, reasoning_effort=args.reasoning_effort,
+                 map_tokens=args.map_tokens)
+    elif args.command == "dispatch":
+        run_dispatch(args.task_id, args.message, args.files, cwd_path,
+                     read_files=args.read_files, test_cmd=args.test_cmd,
+                     tier=args.tier, thinking=args.thinking,
+                     reasoning_effort=args.reasoning_effort,
+                     dry_run=args.dry_run, worktree=args.worktree,
+                     auto_merge=not args.no_auto_merge, verbose=args.verbose)
     elif args.command == "cleanup":
         cleanup_session(args.task_id, cwd_path)
     elif args.command == "merge-worktree":

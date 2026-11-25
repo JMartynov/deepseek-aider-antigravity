@@ -202,6 +202,36 @@ python3 ~/.gemini/config/skills/aider-deepseek/scripts/aider_bridge.py search \
 
 Options: `--count N` (1-50, default 5), `--need-content` (include full page content), `--json` (raw JSON), `--cwd PATH`.
 
+### Step 6: Smart Dispatcher (Auto Tier Routing)
+
+`dispatch` classifies the task and auto-selects the optimal model, thinking mode, edit format, and test wiring:
+
+```bash
+# Dry-run: print the verdict + resolved params without running anything
+python3 ~/.gemini/config/skills/aider-deepseek/scripts/aider_bridge.py dispatch \
+  --task-id "patch_01" --message "Fix typo in README" --files README.md \
+  --dry-run --cwd "/path/to/project"
+
+# Execute the matched tier (Tier 2 surgical + closed-loop TDD here)
+python3 ~/.gemini/config/skills/aider-deepseek/scripts/aider_bridge.py dispatch \
+  --task-id "auth_01" --message "Implement verify_token" --files auth.py \
+  --test-cmd "uv run pytest tests/test_auth.py -q" --worktree --cwd "/path/to/project"
+
+# Force a tier / override thinking effort
+python3 ~/.gemini/config/skills/aider-deepseek/scripts/aider_bridge.py dispatch \
+  --task-id "arch_01" --message "Refactor AST visitors" --files a.py b.py c.py d.py \
+  --tier architect --thinking on --reasoning-effort high --cwd "/path/to/project"
+```
+
+| Tier | Label | Trigger | Model / Thinking | Test-Cmd |
+| :---: | :--- | :--- | :--- | :--- |
+| 1 | `PATCH` | 1 doc/config file (`.md/.txt/.rst/.toml/.yaml/.yml/.json/.ini/.cfg`) or patch keywords (typo, lint, bump, version, docstring, comment, readme, format, rename); no `--test-cmd` | `deepseek-flash` / `off` | off |
+| 2 | `SURGICAL` | 1–3 domain files, localized feature/bugfix, or active `--test-cmd` | `deepseek-flash` / `auto` (low) | active |
+| 3 | `ARCHITECT` | >3 files or complex/AST/concurrency keywords (architect, refactor, ast, visitor, sqlglot, security guard, concurrency, mutex, lock, cross-module, cross-repo, redesign, rewrite, migrate) | `deepseek-reasoner` + `flash` editor / `on` (high) | active |
+| 4 | `RESEARCH` | No editable files with research intent (research, search, lookup, pep, cve, advisory, spec, what is, how does, documentation) or no `--test-cmd` | DeepSeek `search` API | n/a |
+
+Flags: `--tier {auto,patch,surgical,architect,research}`, `--thinking {auto,on,off}`, `--reasoning-effort {low,high,max}`, `--dry-run`, `--worktree`, `--no-auto-merge`, `-v/--verbose`.
+
 ---
 
 ## 📊 Exit Codes & Diagnostics
