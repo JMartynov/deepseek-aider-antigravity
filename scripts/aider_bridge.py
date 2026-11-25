@@ -90,6 +90,153 @@ def fetch_account_balance(api_key: str):
     return None
 
 
+def _normalize_search_payload(data):
+    """Normalize a chat-completions response into {'results': [...]}."""
+    if not isinstance(data, dict):
+        return {"results": []}
+    if isinstance(data.get("results"), list):
+        return data
+    for ch in data.get("choices") or []:
+        msg = (ch or {}).get("message") or {}
+        content = msg.get("content")
+        if isinstance(content, str) and content.strip():
+            try:
+                parsed = json.loads(content)
+                if isinstance(parsed, dict) and isinstance(parsed.get("results"), list):
+                    return parsed
+                if isinstance(parsed, list):
+                    return {"results": parsed}
+            except (json.JSONDecodeError, ValueError):
+                pass
+        for tc in msg.get("tool_calls") or []:
+            args = ((tc or {}).get("function") or {}).get("arguments")
+            if isinstance(args, str) and args.strip():
+                try:
+                    parsed = json.loads(args)
+                    if isinstance(parsed, dict) and isinstance(parsed.get("results"), list):
+                        return parsed
+                    if isinstance(parsed, list):
+                        return {"results": parsed}
+                except (json.JSONDecodeError, ValueError):
+                    pass
+    return {"results": []}
+
+
+def _search_via_chat_completions(query, api_key, count, need_content, timeout):
+    """Fallback search path via chat-completions + deepseek_web_search tool."""
+    url = "https://api.deepseek.com/v1/chat/completions"
+    body = {
+        "model": "deepseek-flash",
+        "tools": [{"type": "deepseek_web_search", "name": "deepseek_web_search"}],
+        "messages": [{
+            "role": "user",
+            "content": f"Search the web for: {query}. Return up to {count} results."
+        }],
+    }
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(body).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return _normalize_search_payload(json.loads(resp.read().decode("utf-8")))
+
+
+def search_web_deepseek(query: str, api_key: str, count: int = 5,
+                        need_content: bool = False, timeout: float = 15.0) -> dict:
+    """POST to DeepSeek search tool endpoint; fall back to chat-completions on 404/405."""
+    url = "https://api.deepseek.com/v1/tools/search"
+    body = {"query": query, "count": count, "need_content": need_content}
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(body).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        if getattr(e, "code", None) in (404, 405):
+            return _search_via_chat_completions(query, api_key, count, need_content, timeout)
+        raise
+
+
+def format_search_results(data: dict, need_content: bool = False) -> str:
+    """Render search results as numbered, human-readable text."""
+    results = (data or {}).get("results") or []
+    if not results:
+        return "No search results found."
+    lines = []
+    for i, r in enumerate(results, 1):
+        r = r or {}
+        title = r.get("title") or "(untitled)"
+        url = r.get("url") or "(no url)"
+        summary = r.get("summary") or r.get("snippet") or ""
+        lines.append(f"{i}. {title}")
+        lines.append(f"   URL: {url}")
+        if summary:
+            lines.append(f"   Summary: {summary}")
+        if need_content:
+            content = r.get("content") or ""
+            if content:
+                lines.append(f"   Content: {content}")
+    return "\n".join(lines)
+
+
+def run_search(query: str, cwd: Path, count: int = 5,
+               need_content: bool = False, as_json: bool = False):
+    """CLI entry: validate, dispatch to DeepSeek search, map errors to exit codes."""
+    load_project_env(cwd)
+    api_key = os.environ.get("DEEPSEEK_API_KEY")
+    if not api_key:
+        print("[ERROR] DEEPSEEK_API_KEY missing from project .env and environment.", file=sys.stderr)
+        sys.exit(1)
+
+    cleaned = (query or "").strip()
+    if not (1 <= len(cleaned) <= 128):
+        print(f"[ERROR] Query must be 1-128 characters after strip (got {len(cleaned)}).", file=sys.stderr)
+        sys.exit(2)
+    try:
+        count_int = int(count)
+    except (TypeError, ValueError):
+        print(f"[ERROR] --count must be an integer between 1 and 50 (got {count!r}).", file=sys.stderr)
+        sys.exit(2)
+    if not (1 <= count_int <= 50):
+        print(f"[ERROR] --count must be between 1 and 50 (got {count_int}).", file=sys.stderr)
+        sys.exit(2)
+
+    try:
+        data = search_web_deepseek(cleaned, api_key, count=count_int, need_content=need_content)
+    except urllib.error.HTTPError as e:
+        code = getattr(e, "code", "?")
+        if code == 429:
+            print("[ERROR] DeepSeek search API rate limit reached (HTTP 429). Retry later.", file=sys.stderr)
+            sys.exit(16)
+        print(f"[ERROR] DeepSeek search API error (HTTP {code}).", file=sys.stderr)
+        sys.exit(17)
+    except (urllib.error.URLError, TimeoutError, OSError) as e:
+        print(f"[ERROR] Network error contacting DeepSeek search API: {e}", file=sys.stderr)
+        sys.exit(18)
+    except (json.JSONDecodeError, ValueError) as e:
+        print(f"[ERROR] Invalid JSON response from DeepSeek search API: {e}", file=sys.stderr)
+        sys.exit(19)
+
+    if as_json:
+        print(json.dumps(data, indent=2, ensure_ascii=False))
+    else:
+        print(format_search_results(data, need_content=need_content))
+
+
 def load_project_env(cwd: Path):
     """Load DEEPSEEK_API_KEY from project .env file only."""
     env_file = cwd / ".env"
@@ -679,6 +826,15 @@ def main():
     log_parser.add_argument("--log-file", required=True, help="Path to the log file to compact")
     log_parser.add_argument("--max-lines", type=int, default=40, help="Trailing non-empty lines to keep (default: 40)")
     
+    search_parser = subparsers.add_parser("search", help="Run a web search via DeepSeek API")
+    search_parser.add_argument("query", help="Search query (1-128 characters after strip)")
+    search_parser.add_argument("--count", type=int, default=5, help="Number of results (1-50, default 5)")
+    search_parser.add_argument("--need-content", action="store_true",
+                               help="Include full page content in results")
+    search_parser.add_argument("--json", action="store_true",
+                               help="Emit raw JSON response instead of formatted text")
+    search_parser.add_argument("--cwd", default=".", help="Project working directory")
+
     args = parser.parse_args()
     cwd_path = Path(getattr(args, "cwd", ".")).resolve()
     
@@ -699,6 +855,9 @@ def main():
             print(f"[ERROR] Log file not found: {log_path}", file=sys.stderr)
             sys.exit(1)
         print(compact_failure_trace(log_path.read_text(), args.max_lines))
+    elif args.command == "search":
+        run_search(args.query, cwd_path, count=args.count,
+                   need_content=args.need_content, as_json=args.json)
 
 
 if __name__ == "__main__":

@@ -93,7 +93,7 @@ DeepSeek runs as a pure remote Large Language Model accessed via API. It **does 
 | **Dependency Resolution** | Owns `uv add`, `uv sync`, `pip install`, or `.venv` creation. | Edits `pyproject.toml` or `requirements.txt` via unified diffs. |
 | **Python Environment** | Manages local virtualenv (`uv` / `.venv`) and parent tasks. | Runs inside the parent project / worktree Python environment. |
 | **Test Execution** | Runs integration suites (`uv run pytest tests/`, `npm test`, etc.). | Auto-lints via `--lint-cmd`; fixes tests via `--auto-test --test-cmd`. |
-| **Web Research** | Performs live web searches (`search_web`) or dynamic browser exploration (`browser` sub-agent). | Disabled by design (`--no-detect-urls`) to avoid token waste. |
+| **Web Research** | Performs live web searches (`search_web`) or dynamic browser exploration (`browser` sub-agent). | Disabled inside Aider (`--no-detect-urls`). Orchestrator can invoke `aider_bridge.py search` for curated web research via DeepSeek's search tool. |
 | **OS CLI Execution** | Full shell access via `run_command` (git, build systems, background tasks). | Restricted to unified diff file modifications inside isolated worktrees. |
 
 ### 7. Orchestrator Pre-Check Gate (Task Readiness Protocol)
@@ -116,6 +116,12 @@ Before delegating any implementation or refactoring task to DeepSeek, the lead o
 - **`--test-cmd <cmd>`**: Enables `--auto-test --test-cmd <cmd>` so the sub-agent verifies and repairs failing tests before returning (exit `0` only when tests pass).
 - **`--dry-run`**: Runs Aider in dry-run mode — diffs are proposed but not written to disk, ideal for low-cost plan/spec review.
 - **`--architect` / `--editor-model`**: Enables a two-model architect workflow (`--architect`). When using `--model deepseek/deepseek-reasoner --architect` and no `--editor-model` is supplied, the editor model defaults to the cheaper/faster `deepseek/deepseek-flash`; pass `--editor-model <name>` to override. `--editor-model` is also honoured without `--architect`.
+
+**Mandatory Delegation Rules for Orchestrator Sub-Agents:**
+1. **NEVER write tests manually in a separate orchestrator turn.** Always pass `--test-cmd "<cmd>"` so Aider runs `--auto-test` itself and self-heals failing assertions inside the same turn (closed-loop TDD). This preserves prefix cache and minimizes token cost.
+2. **NEVER manually re-prompt after a test failure.** Provide the failing test command up front via `--test-cmd`; the sub-agent will iterate internally.
+3. **For complex/multi-file refactors, always use `--architect`** (with `--model deepseek/deepseek-reasoner`) so the plan is authored by the stronger reasoner while surgical diffs are emitted by the cheaper `deepseek/deepseek-flash` editor.
+4. Combine with `--worktree --no-auto-merge` for isolation: review the worktree branch, then `merge-worktree --task-id <id>`.
 
 ---
 
@@ -178,6 +184,24 @@ python3 ~/.gemini/config/skills/aider-deepseek/scripts/aider_bridge.py turn \
   --cwd "/path/to/project"
 ```
 
+### Step 5: Web Search (via DeepSeek Search API)
+
+```bash
+# Basic search (default --count 5)
+python3 ~/.gemini/config/skills/aider-deepseek/scripts/aider_bridge.py search \
+  --cwd "/path/to/project" "Aider 0.86 release notes"
+
+# Custom count + full page content
+python3 ~/.gemini/config/skills/aider-deepseek/scripts/aider_bridge.py search \
+  --count 10 --need-content --cwd "/path/to/project" "pytest async fixtures"
+
+# Machine-readable JSON output for downstream tooling
+python3 ~/.gemini/config/skills/aider-deepseek/scripts/aider_bridge.py search \
+  --json --cwd "/path/to/project" "Python 3.12 PEP 695 syntax"
+```
+
+Options: `--count N` (1-50, default 5), `--need-content` (include full page content), `--json` (raw JSON), `--cwd PATH`.
+
 ---
 
 ## 📊 Exit Codes & Diagnostics
@@ -192,3 +216,8 @@ python3 ~/.gemini/config/skills/aider-deepseek/scripts/aider_bridge.py turn \
 | `13` | `AIDER_INVOCATION_FAILED` | Process error during launch. Target files automatically rolled back. |
 | `14` | `PREFLIGHT_FAILED` | Missing read-only reference file before starting Aider turn. |
 | `15` | `MERGE_FAILED` | Worktree branch failed to cleanly merge into base branch. |
+| `2`  | `INVALID_ARGUMENT`        | Query empty/overlong (1-128 chars) or `--count` out of range (1-50). |
+| `16` | `SEARCH_RATE_LIMITED`     | DeepSeek search API returned HTTP 429. Retry after backoff. |
+| `17` | `SEARCH_API_ERROR`        | Non-429 HTTP error from DeepSeek search API. |
+| `18` | `SEARCH_NETWORK_ERROR`    | `URLError`/`TimeoutError`/`OSError` reaching DeepSeek search. |
+| `19` | `SEARCH_INVALID_RESPONSE` | Malformed JSON from DeepSeek search API. |

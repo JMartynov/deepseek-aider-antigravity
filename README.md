@@ -160,6 +160,17 @@ python3 scripts/aider_bridge.py turn \
   --cwd "<project_dir>"
 ```
 
+### Web Search Delegation
+
+Research external APIs up front instead of burning reasoning tokens on invalid hypotheses:
+
+```bash
+python3 scripts/aider_bridge.py search --cwd "<project_dir>" \
+  --count 10 --need-content "OpenAI Responses API tool schema"
+```
+
+Feed the resulting summary/URLs back into your task prompt or `--read-files` contract. Exit codes: `16` (429 rate limit), `17` (API error), `18` (network), `19` (invalid response).
+
 ---
 
 ## 🏛️ Architecture & Division of Labor
@@ -171,7 +182,7 @@ DeepSeek runs as a pure remote model via API. It **does not install dependencies
 | **Dependency Resolution** | Owns `uv add`, `uv sync`, `pip install`, or `.venv` creation. | Edits `pyproject.toml` or `requirements.txt` via unified diffs. |
 | **Python Environment** | Manages local virtualenv (`uv` / `.venv`) and parent tasks. | Runs inside the parent project / worktree Python environment. |
 | **Test Execution** | Runs integration suites (`uv run pytest tests/`, `npm test`, etc.). | Auto-lints via `--lint-cmd`; fixes tests via `--auto-test --test-cmd`. |
-| **Web Research** | Performs live web searches (`search_web`) or dynamic browser exploration (`browser` sub-agent). | Disabled by design (`--no-detect-urls`) to avoid token waste. |
+| **Web Research** | Performs live web searches (`search_web`) or dynamic browser exploration (`browser` sub-agent). | Disabled inside Aider (`--no-detect-urls`); orchestrator can call `aider_bridge.py search` for research. |
 | **OS CLI Execution** | Full shell access via `run_command` (git, build systems, background tasks). | Restricted to unified diff file modifications inside isolated worktrees. |
 
 ### Orchestrator Pre-Check Gate (Task Readiness Checklist)
@@ -182,7 +193,12 @@ Before dispatching a task to DeepSeek:
 4. **Worktree Isolation**: Use `--worktree` and `--no-auto-merge` for clean branch isolation and multi-pass reviews.
 
 ### Closed-Loop TDD Delegation Pattern
-Pass `--test-cmd <cmd>` alongside `--worktree --no-auto-merge` to run a full isolated TDD loop: DeepSeek applies surgical diffs, Aider immediately runs `--auto-test --test-cmd <cmd>`, and any failing assertions are fed back to the model to self-heal before the turn completes (exit `0` only when tests pass). Review the worktree, then merge explicitly with `merge-worktree`.
+
+**Orchestrator sub-agents MUST prefer closed-loop delegation over manual crafting:**
+
+- **Tests:** Pass `--test-cmd "<cmd>"` — never hand-write test files in a separate turn, and never re-prompt manually after a failure. Aider runs `--auto-test` and lets DeepSeek self-heal within the same turn.
+- **Refactors:** Pass `--architect` (often `--model deepseek/deepseek-reasoner`) so the plan is authored by the reasoner model and surgical diffs are emitted by the cheaper `deepseek/deepseek-flash` editor default.
+- **Isolation:** Combine both with `--worktree --no-auto-merge`; review the branch, then run `merge-worktree --task-id <id>`.
 
 Additional advanced flags:
 - **`--test-cmd <cmd>`** — enables `--auto-test --test-cmd <cmd>` (self-healing test loop).

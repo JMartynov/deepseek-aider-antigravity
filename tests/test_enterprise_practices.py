@@ -10,14 +10,27 @@ Tests:
 """
 
 import sys
+import json
 import tempfile
 import subprocess
+import urllib.error
 from pathlib import Path
 
 SCRIPTS_DIR = Path(__file__).resolve().parent.parent / "scripts"
 sys.path.insert(0, str(SCRIPTS_DIR))
 
 import aider_bridge
+
+
+class _MockHTTPResponse:
+    def __init__(self, body_bytes):
+        self._body = body_bytes
+    def read(self):
+        return self._body
+    def __enter__(self):
+        return self
+    def __exit__(self, *exc):
+        return False
 
 
 def test_compact_failure_trace_ansi_and_tail():
@@ -334,6 +347,251 @@ def test_architect_argument_wiring(monkeypatch):
         assert "--architect" in cmd
         idx = cmd.index("--editor-model")
         assert cmd[idx + 1] == "custom/editor"
+
+
+def test_search_default_post_request(monkeypatch):
+    captured = {}
+
+    def mock_urlopen(req, timeout=None):
+        captured["req"] = req
+        return _MockHTTPResponse(json.dumps({"results": []}).encode())
+
+    monkeypatch.setattr(aider_bridge.urllib.request, "urlopen", mock_urlopen)
+
+    aider_bridge.search_web_deepseek("deepseek", "sk-test")
+
+    req = captured["req"]
+    assert req.get_full_url() == "https://api.deepseek.com/v1/tools/search"
+    assert req.get_method() == "POST"
+    assert req.get_header("Authorization") == "Bearer sk-test"
+    assert req.get_header("Content-type") == "application/json"
+    assert req.get_header("Accept") == "application/json"
+    assert json.loads(req.data) == {"query": "deepseek", "count": 5, "need_content": False}
+
+
+def test_search_custom_flags(monkeypatch):
+    captured = {}
+
+    def mock_urlopen(req, timeout=None):
+        captured["req"] = req
+        return _MockHTTPResponse(json.dumps({"results": []}).encode())
+
+    monkeypatch.setattr(aider_bridge.urllib.request, "urlopen", mock_urlopen)
+
+    aider_bridge.search_web_deepseek("query", "sk-test", count=10, need_content=True)
+
+    assert json.loads(captured["req"].data) == {"query": "query", "count": 10, "need_content": True}
+
+
+def test_format_search_results_basic():
+    data = {"results": [{"title": "T1", "url": "https://ex.com", "summary": "S1"}]}
+    out = aider_bridge.format_search_results(data, need_content=False)
+    assert "T1" in out
+    assert "https://ex.com" in out
+    assert "S1" in out
+    assert "Content:" not in out
+
+
+def test_format_search_results_with_content():
+    data = {"results": [{"title": "T1", "url": "u1", "summary": "s1", "content": "full body"}]}
+    out = aider_bridge.format_search_results(data, need_content=True)
+    assert "Content: full body" in out
+
+
+def test_format_search_results_empty():
+    assert aider_bridge.format_search_results({"results": []}) == "No search results found."
+
+
+def test_run_search_json_cli(monkeypatch, capsys):
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
+    resp = {"results": [{"title": "T", "url": "U", "summary": "S"}]}
+
+    def mock_urlopen(req, timeout=None):
+        return _MockHTTPResponse(json.dumps(resp).encode())
+
+    monkeypatch.setattr(aider_bridge.urllib.request, "urlopen", mock_urlopen)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        aider_bridge.run_search("query", Path(tmpdir), as_json=True)
+
+    out = capsys.readouterr().out
+    assert json.loads(out) == resp
+
+
+def test_run_search_loads_env_from_cwd(monkeypatch):
+    captured = {}
+
+    def mock_urlopen(req, timeout=None):
+        captured["req"] = req
+        return _MockHTTPResponse(json.dumps({"results": []}).encode())
+
+    monkeypatch.setattr(aider_bridge.urllib.request, "urlopen", mock_urlopen)
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmppath = Path(tmpdir)
+        (tmppath / ".env").write_text('DEEPSEEK_API_KEY="sk-from-env"\n')
+        aider_bridge.run_search("query", tmppath)
+
+    assert captured["req"].get_header("Authorization") == "Bearer sk-from-env"
+
+
+def test_run_search_missing_key(monkeypatch):
+    import pytest
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        with pytest.raises(SystemExit) as exc:
+            aider_bridge.run_search("query", Path(tmpdir))
+        assert exc.value.code == 1
+
+
+def test_run_search_invalid_query_empty(monkeypatch):
+    import pytest
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
+    with tempfile.TemporaryDirectory() as tmpdir:
+        with pytest.raises(SystemExit) as exc:
+            aider_bridge.run_search("   ", Path(tmpdir))
+        assert exc.value.code == 2
+
+
+def test_run_search_invalid_query_overlong(monkeypatch):
+    import pytest
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
+    with tempfile.TemporaryDirectory() as tmpdir:
+        with pytest.raises(SystemExit) as exc:
+            aider_bridge.run_search("x" * 129, Path(tmpdir))
+        assert exc.value.code == 2
+
+
+def test_run_search_invalid_count(monkeypatch):
+    import pytest
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
+    with tempfile.TemporaryDirectory() as tmpdir:
+        for bad in (0, 51):
+            with pytest.raises(SystemExit) as exc:
+                aider_bridge.run_search("query", Path(tmpdir), count=bad)
+            assert exc.value.code == 2
+
+
+def test_run_search_rate_limit_429(monkeypatch):
+    import pytest
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
+
+    def mock_urlopen(req, timeout=None):
+        raise urllib.error.HTTPError(req.get_full_url(), 429, "Too Many", {}, None)
+
+    monkeypatch.setattr(aider_bridge.urllib.request, "urlopen", mock_urlopen)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        with pytest.raises(SystemExit) as exc:
+            aider_bridge.run_search("query", Path(tmpdir))
+        assert exc.value.code == 16
+
+
+def test_run_search_api_error_500(monkeypatch):
+    import pytest
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
+
+    def mock_urlopen(req, timeout=None):
+        raise urllib.error.HTTPError(req.get_full_url(), 500, "Server Error", {}, None)
+
+    monkeypatch.setattr(aider_bridge.urllib.request, "urlopen", mock_urlopen)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        with pytest.raises(SystemExit) as exc:
+            aider_bridge.run_search("query", Path(tmpdir))
+        assert exc.value.code == 17
+
+
+def test_run_search_404_fallback(monkeypatch, capsys):
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
+    seen_urls = []
+
+    def mock_urlopen(req, timeout=None):
+        seen_urls.append(req.get_full_url())
+        if len(seen_urls) == 1:
+            raise urllib.error.HTTPError(req.get_full_url(), 404, "Not Found", {}, None)
+        body = {
+            "choices": [{
+                "message": {
+                    "content": json.dumps({"results": [{"title": "T", "url": "U", "summary": "S"}]})
+                }
+            }]
+        }
+        return _MockHTTPResponse(json.dumps(body).encode())
+
+    monkeypatch.setattr(aider_bridge.urllib.request, "urlopen", mock_urlopen)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        aider_bridge.run_search("query", Path(tmpdir))
+
+    out = capsys.readouterr().out
+    assert "T" in out
+    assert "U" in out
+    assert "S" in out
+    assert len(seen_urls) == 2
+    assert seen_urls[1] == "https://api.deepseek.com/v1/chat/completions"
+
+
+def test_run_search_urlerror_network(monkeypatch):
+    import pytest
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
+
+    def mock_urlopen(req, timeout=None):
+        raise urllib.error.URLError("boom")
+
+    monkeypatch.setattr(aider_bridge.urllib.request, "urlopen", mock_urlopen)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        with pytest.raises(SystemExit) as exc:
+            aider_bridge.run_search("query", Path(tmpdir))
+        assert exc.value.code == 18
+
+
+def test_run_search_timeout(monkeypatch):
+    import pytest
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
+
+    def mock_urlopen(req, timeout=None):
+        raise TimeoutError()
+
+    monkeypatch.setattr(aider_bridge.urllib.request, "urlopen", mock_urlopen)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        with pytest.raises(SystemExit) as exc:
+            aider_bridge.run_search("query", Path(tmpdir))
+        assert exc.value.code == 18
+
+
+def test_run_search_invalid_json(monkeypatch):
+    import pytest
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
+
+    def mock_urlopen(req, timeout=None):
+        return _MockHTTPResponse(b"not json")
+
+    monkeypatch.setattr(aider_bridge.urllib.request, "urlopen", mock_urlopen)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        with pytest.raises(SystemExit) as exc:
+            aider_bridge.run_search("query", Path(tmpdir))
+        assert exc.value.code == 19
+
+
+def test_search_cli_main_wiring(monkeypatch, capsys):
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
+    captured = {}
+    payload = {"results": [{"title": "CLI Title", "url": "https://cli.test", "summary": "CLI Sum", "content": "Full"}]}
+
+    def mock_urlopen(req, timeout=None):
+        captured["body"] = json.loads(req.data)
+        return _MockHTTPResponse(json.dumps(payload).encode())
+
+    monkeypatch.setattr(aider_bridge.urllib.request, "urlopen", mock_urlopen)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            ["aider_bridge.py", "search", "my cli query", "--count", "3", "--need-content", "--json", "--cwd", tmpdir],
+        )
+        aider_bridge.main()
+
+    assert captured["body"] == {"query": "my cli query", "count": 3, "need_content": True}
+    out = capsys.readouterr().out
+    assert json.loads(out) == payload
 
 
 def test_worktree_forwards_advanced_flags(monkeypatch):
