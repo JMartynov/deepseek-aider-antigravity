@@ -196,6 +196,20 @@ def format_search_results(data: dict, need_content: bool = False) -> str:
 
 
 SUPPORTED_TIERS = ("patch", "surgical", "architect", "research")
+ARCHITECT_AUTO_EDITOR_MODELS = frozenset({
+    "deepseek/deepseek-reasoner",
+    "deepseek/deepseek-v4-pro",
+})
+
+
+def _resolve_editor_model(model: str, architect: bool = False,
+                          editor_model: str = None):
+    """Resolve the architect editor model, defaulting to flash for high-reasoning models."""
+    if editor_model:
+        return editor_model
+    if architect and model in ARCHITECT_AUTO_EDITOR_MODELS:
+        return "deepseek/deepseek-flash"
+    return None
 
 RESEARCH_KEYWORDS = (
     "research", "search", "lookup", "look up", "pep", "cve", "advisory",
@@ -345,11 +359,15 @@ def classify_task(message: str, files: list[str] = None,
 
 def run_dispatch(task_id: str, message: str, files: list[str], cwd: Path,
                  read_files: list[str] = None, test_cmd: str = None,
+                 lint_cmd: str = None, model: str = None,
+                 editor_model: str = None, map_tokens: int = None,
+                 architect: bool = False,
                  tier: str = "auto", thinking: str = "auto",
                  reasoning_effort: str = None, dry_run: bool = False,
                  worktree: bool = False, auto_merge: bool = True,
                  verbose: bool = False, plan_align: bool = False,
-                 restore: bool = False):
+                 restore: bool = False, count: int = 5,
+                 need_content: bool = False, as_json: bool = False):
     """
     Classify a task into its optimal precision tier and dispatch it to the
     matching model/thinking/edit-format configuration (or DeepSeek search).
@@ -360,12 +378,36 @@ def run_dispatch(task_id: str, message: str, files: list[str], cwd: Path,
     )
 
     # Explicit CLI overrides win over tier defaults
+    if model:
+        resolved["model"] = model
+    if architect:
+        resolved["architect"] = True
+    if editor_model:
+        resolved["editor_model"] = editor_model
+    if resolved.get("architect") and not resolved.get("editor_model"):
+        auto_ed = _resolve_editor_model(
+            resolved.get("model"),
+            architect=True,
+            editor_model=None,
+        )
+        if auto_ed:
+            resolved["editor_model"] = auto_ed
+    if map_tokens is not None:
+        resolved["map_tokens"] = map_tokens
+    if lint_cmd is not None:
+        resolved["lint_cmd"] = lint_cmd
+    else:
+        resolved.setdefault("lint_cmd", None)
     if thinking and thinking != "auto":
         resolved["thinking"] = thinking
     if reasoning_effort:
         resolved["reasoning_effort"] = reasoning_effort
     effective_plan_align = plan_align or (bool(resolved.get("plan_align", False)) and not restore)
     resolved["plan_align"] = effective_plan_align
+    if tier_name == "research":
+        resolved["count"] = count
+        resolved["need_content"] = need_content
+        resolved["as_json"] = as_json
 
     print(
         f"[DISPATCHER] Classified as TIER {resolved['tier_num']}: "
@@ -377,21 +419,28 @@ def run_dispatch(task_id: str, message: str, files: list[str], cwd: Path,
         print("[DISPATCHER] Resolved parameters:")
         for key in ("model", "thinking", "reasoning_effort", "edit_format",
                     "map_tokens", "architect", "editor_model", "plan_align",
-                    "test_cmd", "command", "query"):
+                    "test_cmd", "lint_cmd", "command", "query",
+                    "count", "need_content", "as_json"):
             if key in resolved:
                 print(f"  {key}: {resolved[key]}")
         print("[STATUS] DRY_RUN")
         sys.exit(0)
 
     if tier_name == "research":
-        run_search(resolved.get("query") or (message or ""), cwd)
+        run_search(
+            resolved.get("query") or (message or ""),
+            cwd,
+            count=count,
+            need_content=need_content,
+            as_json=as_json,
+        )
         return
 
     run_turn(
         task_id, message, files, cwd,
         read_files=read_files, restore=restore,
         model=resolved.get("model") or "deepseek/deepseek-flash",
-        lint_cmd=None,
+        lint_cmd=resolved.get("lint_cmd"),
         test_cmd=resolved.get("test_cmd"),
         dry_run=False,
         architect=resolved.get("architect", False),
@@ -814,11 +863,12 @@ def create_ephemeral_model_settings(cwd: Path, model: str, editor_model: str = N
     caches_by_default=True and edit_format=diff configured in Aider settings.
     Optionally emit an editor-model entry with editor-diff and thinking disabled.
     """
+    resolved_editor = _resolve_editor_model(model, architect=architect, editor_model=editor_model)
     model_is_deepseek = bool(model) and "deepseek" in model.lower()
     editor_is_deepseek = (
-        bool(editor_model)
-        and "deepseek" in editor_model.lower()
-        and editor_model != model
+        bool(resolved_editor)
+        and "deepseek" in resolved_editor.lower()
+        and resolved_editor != model
     )
     if not model_is_deepseek and not editor_is_deepseek:
         return None
@@ -841,7 +891,7 @@ def create_ephemeral_model_settings(cwd: Path, model: str, editor_model: str = N
             lines.extend(extra)
 
     if editor_is_deepseek:
-        lines.append(f"- name: {editor_model}")
+        lines.append(f"- name: {resolved_editor}")
         lines.append("  edit_format: editor-diff")
         lines.append("  caches_by_default: true")
         lines.append("  examples_as_sys_msg: true")
@@ -1322,13 +1372,11 @@ def run_turn(task_id: str, message: str, files: list[str], cwd: Path,
     ignore_path = create_ephemeral_aiderignore(cwd)
     cmd.extend(["--aiderignore", str(ignore_path)])
 
-    # Resolve the architect editor model early so settings can include it
-    resolved_editor_model = editor_model
-    if architect and not resolved_editor_model and model == "deepseek/deepseek-reasoner":
-        resolved_editor_model = "deepseek/deepseek-flash"
-
     # During Stage 1 planning (--chat-mode ask), suppress architect/editor & auto-lint/test
     effective_architect = architect and not plan_align
+    resolved_editor_model = _resolve_editor_model(
+        model, architect=effective_architect, editor_model=editor_model
+    )
     effective_editor_model = None if plan_align else resolved_editor_model
 
     # Ephemeral model settings for explicit prompt caching and diff format
@@ -1670,7 +1718,12 @@ def main():
     dispatch_parser.add_argument("--message", required=True, help="Task specification / research query")
     dispatch_parser.add_argument("--files", nargs="*", default=[], help="Editable target files")
     dispatch_parser.add_argument("--read-files", nargs="*", default=[], help="Read-only reference files")
+    dispatch_parser.add_argument("--model", default=None, help="Override resolved tier model")
+    dispatch_parser.add_argument("--editor-model", default=None, help="Override architect editor model")
+    dispatch_parser.add_argument("--architect", action="store_true", help="Force two-model architect mode (--architect)")
+    dispatch_parser.add_argument("--lint-cmd", default=None, help="Custom lint command passed to Aider (enables --auto-lint)")
     dispatch_parser.add_argument("--test-cmd", default=None, help="Test command enabling closed-loop TDD")
+    dispatch_parser.add_argument("--map-tokens", type=int, default=None, help="Override Aider repo-map token budget")
     dispatch_parser.add_argument("--tier", default="auto", choices=["auto", "patch", "surgical", "architect", "research"], help="Force a tier (default: auto)")
     dispatch_parser.add_argument("--thinking", default="auto", choices=["auto", "on", "off"], help="Override thinking mode")
     dispatch_parser.add_argument("--reasoning-effort", default=None, choices=["low", "high", "max"], help="Override reasoning effort")
@@ -1682,6 +1735,9 @@ def main():
                                  help="Stage 1 planning: propose architecture, do not edit files")
     dispatch_parser.add_argument("--restore", action="store_true",
                                  help="Restore prior session history when dispatch resumes a session")
+    dispatch_parser.add_argument("--count", type=int, default=5, help="Search result count when routed to Tier 4 research (1-50, default 5)")
+    dispatch_parser.add_argument("--need-content", action="store_true", help="Include full page content when routed to Tier 4 research")
+    dispatch_parser.add_argument("--json", action="store_true", help="Emit raw JSON response when routed to Tier 4 research")
     dispatch_parser.add_argument("--cwd", default=".", help="Project working directory")
     
     clean_parser = subparsers.add_parser("cleanup", help="Clean up session history file")
@@ -1733,11 +1789,16 @@ def main():
     elif args.command == "dispatch":
         run_dispatch(args.task_id, args.message, args.files, cwd_path,
                      read_files=args.read_files, test_cmd=args.test_cmd,
+                     lint_cmd=args.lint_cmd, model=args.model,
+                     editor_model=args.editor_model, map_tokens=args.map_tokens,
+                     architect=args.architect,
                      tier=args.tier, thinking=args.thinking,
                      reasoning_effort=args.reasoning_effort,
                      dry_run=args.dry_run, worktree=args.worktree,
                      auto_merge=not args.no_auto_merge, verbose=args.verbose,
-                     plan_align=args.plan_align, restore=args.restore)
+                     plan_align=args.plan_align, restore=args.restore,
+                     count=args.count, need_content=args.need_content,
+                     as_json=args.json)
     elif args.command == "cleanup":
         cleanup_session(args.task_id, cwd_path)
     elif args.command == "inspect":

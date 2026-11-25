@@ -257,7 +257,29 @@ python3 scripts/aider_bridge.py dispatch \
 | 3 | `ARCHITECT` | >3 files or complex/AST/concurrency keywords | `deepseek-reasoner` + `flash` editor / `on` (high) | active |
 | 4 | `RESEARCH` | No editable files with research intent, or no `--test-cmd` | DeepSeek `search` API | n/a |
 
-Flags: `--tier {auto,patch,surgical,architect,research}`, `--thinking {auto,on,off}`, `--reasoning-effort {low,high,max}`, `--dry-run`, `--worktree`, `--no-auto-merge`, `-v/--verbose`, `--plan-align`, `--restore` (resumes a session on dispatch).
+Flags: `--tier {auto,patch,surgical,architect,research}`, `--model`, `--editor-model`, `--architect`, `--thinking {auto,on,off}`, `--reasoning-effort {low,high,max}`, `--map-tokens`, `--lint-cmd`, `--test-cmd`, `--dry-run`, `--worktree`, `--no-auto-merge`, `-v/--verbose`, `--plan-align`, `--restore` (resumes a session on dispatch), `--count`, `--need-content`, `--json` (Tier 4 research).
+
+### Complete DeepSeek Options & Smart Dispatcher Reference Matrix
+
+| Category | Option / Setting | Subcommands | What It Does | When to Use |
+| :--- | :--- | :--- | :--- | :--- |
+| **Models** | `--model` (`deepseek/deepseek-flash`, `deepseek/deepseek-reasoner`, `deepseek/deepseek-v4-pro`) | `turn`, `dispatch` | Selects primary model (Tier 1/2 default: `flash`; Tier 3 default: `reasoner`). | Use `flash` for fast/cheap edits; `reasoner` or `v4-pro` for deep architecture, concurrency, or AST tasks. |
+| **Models** | `--editor-model` | `turn`, `dispatch` | Sets editor model in `--architect` mode (`editor-diff`, thinking disabled). Auto-defaults to `deepseek/deepseek-flash` for `reasoner` and `v4-pro`. | Leave default for cost-optimal two-model editing; override only when a specialized editor model is required. |
+| **Reasoning** | `--thinking {auto,on,off}` | `turn`, `dispatch` | Controls `extra_params.thinking.type` in ephemeral YAML and passes `--thinking-tokens 0` when `off`. | `off` for typos/docs/config (Tier 1); `auto` for localized code (Tier 2); `on` for complex design/debugging (Tier 3). |
+| **Reasoning** | `--reasoning-effort {low,high,max}` | `turn`, `dispatch` | Sets `extra_params.reasoning_effort` and `--reasoning-effort` CLI flag. | `low` for surgical fixes; `high` for multi-file refactors; `max` for subtle concurrency/security invariants. |
+| **Execution** | `--architect` | `turn`, `dispatch` | Enables two-model architect + editor workflow (`--architect`). Suppressed during Stage 1 `--plan-align`. | Multi-file (>3) or structural refactors where planning separates from diff emission. |
+| **Execution** | `--plan-align` | `turn`, `dispatch` | Stage 1 read-only `--chat-mode ask`; forbids edits and escalates structured `QUESTION: [STAGE: PLANNING]`. | Auto-enabled on Tier 3 (unless `--restore`); pass explicitly when architectural alignment is needed first. |
+| **Execution** | `--dry-run` | `turn`, `dispatch` | On `dispatch`, prints tier classification + resolved params without running; on `turn`, passes `--dry-run` to Aider. | Verify dispatcher routing (`dispatch --dry-run`) or preview diffs without disk writes (`turn --dry-run`). |
+| **Execution** | `--restore` | `turn`, `dispatch` | Passes `--restore-chat-history` and omits re-prepending `system_rules` to preserve ~90%+ prefix cache. | Resuming after exit `10` or continuing an existing task session (e.g., Tier 3 Stage 2 via `dispatch`). |
+| **Execution** | `--worktree` / `--no-auto-merge` | `turn`, `dispatch` | Runs in `.worktrees/<task_id>` (`task/<task_id>`); `--no-auto-merge` keeps branch for review before `merge-worktree`. | Parallel sub-agents or multi-pass TDD/review workflows requiring clean branch isolation. |
+| **Quality** | `--test-cmd <cmd>` | `turn`, `dispatch` | Wires `--auto-test --test-cmd <cmd>` so Aider self-heals failing tests in the same turn. | Any bugfix/feature with tests (closed-loop TDD); auto-upgrades Tier 1 doc edits to Tier 2 `surgical`. |
+| **Quality** | `--lint-cmd <cmd>` | `turn`, `dispatch` | Wires `--auto-lint --lint-cmd <cmd>` (auto-defaults to `python:python -m py_compile` for `.py` files). | Pass custom linters (e.g., `ruff check`, `eslint`) to catch & self-heal lint errors in-turn. |
+| **Context** | `--files` / `--read-files` | `turn`, `dispatch` | `--files` are editable targets; `--read-files` open read-only via `--read` (preflight fails exit `14` if missing). | Always scope strictly to explicit paths; protect interfaces/schemas/specs with `--read-files`. |
+| **Context** | `--map-tokens <N>` | `turn`, `dispatch` | Sets Aider `--map-tokens` repo-map budget (Tier 1/4: `0`, Tier 2/3: `512`). | Keep `0` for isolated single-file edits; `512`+ when cross-file symbol awareness is needed. |
+| **Caching** | `caches_by_default`, `examples_as_sys_msg` | Ephemeral YAML | Automatically written to `.aider.model.settings.<pid>.yml` for all DeepSeek models with `edit_format: diff` (`editor-diff` for editor). | Always active automatically for DeepSeek models to maximize server-side prefix cache hits. |
+| **Search** | `--count`, `--need-content`, `--json` | `search`, `dispatch` (Tier 4) | Configures DeepSeek search results (`1–50`, full page body, raw JSON output). | Research external APIs, PEPs, CVEs, or docs before coding (Tier 4 routes here automatically). |
+| **Async / Guard** | `inspect`, `reply`, `merge-worktree`, `cleanup`, `compact-log` | Standalone subcommands | Inspects `state.json`/`outbox.jsonl` (`--json`), answers pending questions (`--answer`, `--source`, `--approved-option`), guards merges (`AWAITING_*` → exit `5`), cleans sessions, compacts logs. | Use after exit `10`, before merging worktrees, after completion, or when triaging long error logs. |
+| **Telemetry** | `-v` / `--verbose`, `filter_turn_output`, `strip_thinking_block` | `turn`, `dispatch` | Strips startup banners and `► **THINKING** ... ► **ANSWER**` blocks by default; `-v` retains raw traces. | Leave off by default for token sparsity; enable `-v` only when debugging raw reasoning traces. |
 
 ---
 
