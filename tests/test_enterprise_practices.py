@@ -1130,3 +1130,131 @@ def test_load_project_env_export_quotes_and_error_secret_sanitization(monkeypatc
         err_out = capsys.readouterr().err
         assert "sk-live-secret-99999" not in err_out
         assert "[REDACTED]" in err_out
+
+
+# ---------------------------------------------------------------------------
+# Regression fixes: API-key preflight, binary archive ignores, reflection stalls
+# ---------------------------------------------------------------------------
+
+def test_run_turn_validates_api_key_before_creating_worktree(monkeypatch, tmp_path):
+    import pytest
+    subprocess.run(["git", "init", "-b", "main"], cwd=tmp_path, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "TestUser"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=tmp_path, check=True)
+    (tmp_path / "foo.py").write_text("x = 1\n")
+    subprocess.run(["git", "add", "."], cwd=tmp_path, check=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=tmp_path, check=True)
+
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+
+    with pytest.raises(SystemExit) as exc:
+        aider_bridge.run_turn(
+            "no_key_wt", "Implement feature", ["foo.py"], tmp_path,
+            model="deepseek/deepseek-flash", worktree=True,
+        )
+    assert exc.value.code == 1
+    assert not (tmp_path / ".worktrees" / "no_key_wt").exists()
+    branches = subprocess.run(
+        ["git", "branch", "--list", "task/no_key_wt"],
+        cwd=tmp_path, capture_output=True, text=True, check=True,
+    )
+    assert branches.stdout.strip() == ""
+
+
+def test_run_turn_loads_dotenv_before_creating_worktree(monkeypatch, tmp_path):
+    import os
+    import pytest
+    subprocess.run(["git", "init", "-b", "main"], cwd=tmp_path, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "TestUser"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=tmp_path, check=True)
+    (tmp_path / "foo.py").write_text("x = 1\n")
+    subprocess.run(["git", "add", "."], cwd=tmp_path, check=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=tmp_path, check=True)
+    (tmp_path / ".env").write_text("DEEPSEEK_API_KEY=sk-from-project-env\n")
+
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+    seen = {}
+
+    class _Stop(Exception):
+        pass
+
+    def spy(task_id, cwd, base_branch=None):
+        seen["key"] = os.environ.get("DEEPSEEK_API_KEY")
+        raise _Stop()
+
+    monkeypatch.setattr(aider_bridge, "create_task_worktree", spy)
+
+    with pytest.raises(_Stop):
+        aider_bridge.run_turn(
+            "dotenv_wt", "Implement feature", ["foo.py"], tmp_path,
+            model="deepseek/deepseek-flash", worktree=True,
+        )
+    assert seen["key"] == "sk-from-project-env"
+
+
+def test_run_turn_non_deepseek_proceeds_without_api_key(monkeypatch, tmp_path):
+    import pytest
+    from types import SimpleNamespace
+    subprocess.run(["git", "init", "-b", "main"], cwd=tmp_path, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "TestUser"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=tmp_path, check=True)
+    (tmp_path / "foo.py").write_text("x = 1\n")
+    subprocess.run(["git", "add", "."], cwd=tmp_path, check=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=tmp_path, check=True)
+
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+    captured = {}
+
+    def mock_run(cmd, cwd=None, capture_output=True, text=True):
+        if cmd and cmd[0] == "uvx":
+            captured["cmd"] = list(cmd)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(aider_bridge.subprocess, "run", mock_run)
+    monkeypatch.setattr(aider_bridge, "fetch_account_balance", lambda *a, **k: None)
+
+    with pytest.raises(SystemExit) as exc:
+        aider_bridge.run_turn("non_ds", "Implement feature", ["foo.py"], tmp_path,
+                              model="openai/gpt-4o")
+    assert exc.value.code == 0
+    assert "cmd" in captured
+
+
+def test_aiderignore_excludes_binary_archives(tmp_path):
+    ignore_path = aider_bridge.create_ephemeral_aiderignore(tmp_path)
+    content = ignore_path.read_text()
+    for pattern in ("*.gz", "*.zip", "*.tar", "*.tgz", "*.pickle", "*.pkl", "*.bin"):
+        assert pattern in content
+    aider_bridge.remove_ephemeral_aiderignore(ignore_path)
+
+
+def test_check_diff_detects_reflection_and_decode_stalls():
+    assert aider_bridge.check_diff_applied_successfully(
+        "Only 3 reflections allowed, stopping.") is False
+    assert aider_bridge.check_diff_applied_successfully(
+        "UnicodeDecodeError: 'utf-8' codec can't decode byte 0xff in position 0") is False
+    assert aider_bridge.check_diff_applied_successfully("Applied edit to foo.py") is True
+
+
+def test_run_turn_reflection_and_decode_stalls_exit_11_and_mark_failed(monkeypatch, tmp_path):
+    import pytest
+    from types import SimpleNamespace
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
+    monkeypatch.setattr(aider_bridge, "fetch_account_balance", lambda *a, **k: None)
+
+    stalls = {
+        "refl_stall": "Only 3 reflections allowed, stopping.\n",
+        "decode_stall": "UnicodeDecodeError: 'utf-8' codec can't decode byte 0xff\n",
+    }
+    for task_id, stall in stalls.items():
+        monkeypatch.setattr(
+            aider_bridge.subprocess, "run",
+            lambda *a, _s=stall, **k: SimpleNamespace(returncode=0, stdout=_s, stderr=""),
+        )
+        with pytest.raises(SystemExit) as exc:
+            aider_bridge.run_turn(task_id, "Implement feature", ["foo.py"], tmp_path)
+        assert exc.value.code == 11
+        state = json.loads(
+            (tmp_path / ".aider-sessions" / task_id / "state.json").read_text()
+        )
+        assert state["status"] == "FAILED"

@@ -946,6 +946,10 @@ def check_diff_applied_successfully(output: str):
         r"The search block did not match",
         r"did not find the search block"
     ]
+    failure_patterns.extend([
+        r'Only 3 reflections allowed',
+        r"codec can't decode byte",
+    ])
     for pattern in failure_patterns:
         if re.search(pattern, clean_output, re.IGNORECASE):
             return False
@@ -959,6 +963,13 @@ def create_ephemeral_aiderignore(cwd: Path):
         ".env*",
         "*.pem",
         "*.key",
+        "*.gz",
+        "*.zip",
+        "*.tar",
+        "*.tgz",
+        "*.pickle",
+        "*.pkl",
+        "*.bin",
         "__pycache__/",
         "*.pyc",
         ".pytest_cache/",
@@ -1419,6 +1430,29 @@ def run_turn(task_id: str, message: str, files: list[str], cwd: Path,
 
     session_root = session_root or cwd
 
+    # Path containment validation first (security guard)
+    cwd_resolved = cwd.resolve()
+    for f in (files or []) + (read_files or []):
+        resolved = (cwd / f).resolve()
+        if resolved == cwd_resolved or not resolved.is_relative_to(cwd_resolved):
+            print(f"[ERROR] Security violation: path '{f}' is outside project root!", file=sys.stderr)
+            sys.exit(12)
+
+    load_project_env(cwd)
+    if session_root != cwd:
+        load_project_env(session_root)
+
+    resolved_editor_for_key = _resolve_editor_model(
+        model, architect=architect, editor_model=editor_model
+    )
+    uses_deepseek = bool(
+        (model and "deepseek" in model.lower())
+        or (resolved_editor_for_key and "deepseek" in resolved_editor_for_key.lower())
+    )
+    if uses_deepseek and not os.environ.get("DEEPSEEK_API_KEY"):
+        print("[ERROR] DEEPSEEK_API_KEY not found in project .env file!", file=sys.stderr)
+        sys.exit(1)
+
     if worktree:
         worktree_path, branch_name = create_task_worktree(task_id, cwd)
         env_src = cwd / ".env"
@@ -1437,22 +1471,7 @@ def run_turn(task_id: str, message: str, files: list[str], cwd: Path,
             code = e.code if isinstance(e.code, int) else (0 if e.code is None else 1)
             _handle_worktree_turn_exit(task_id, worktree_path, branch_name, cwd, auto_merge, code)
             raise
-    # Path containment validation first (security guard)
-    cwd_resolved = cwd.resolve()
-    for f in (files or []) + (read_files or []):
-        resolved = (cwd / f).resolve()
-        if resolved == cwd_resolved or not resolved.is_relative_to(cwd_resolved):
-            print(f"[ERROR] Security violation: path '{f}' is outside project root!", file=sys.stderr)
-            sys.exit(12)
-            
     run_preflight_checks(read_files, cwd)
-    load_project_env(cwd)
-    if session_root != cwd:
-        load_project_env(session_root)
-    
-    if not os.environ.get("DEEPSEEK_API_KEY"):
-        print("[ERROR] DEEPSEEK_API_KEY not found in project .env file!", file=sys.stderr)
-        sys.exit(1)
 
     # --- Structured session directory management ---
     session_dir = get_session_dir(task_id, session_root)
