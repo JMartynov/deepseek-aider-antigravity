@@ -245,6 +245,7 @@ def _resolve_tier_params(tier: str, test_cmd: str = None, message: str = "") -> 
             "map_tokens": 0,
             "architect": False,
             "editor_model": None,
+            "plan_align": False,
             "test_cmd": test_cmd,
         }
     if tier == "surgical":
@@ -258,6 +259,7 @@ def _resolve_tier_params(tier: str, test_cmd: str = None, message: str = "") -> 
             "map_tokens": 512,
             "architect": False,
             "editor_model": None,
+            "plan_align": False,
             "test_cmd": test_cmd,
         }
     if tier == "architect":
@@ -271,6 +273,7 @@ def _resolve_tier_params(tier: str, test_cmd: str = None, message: str = "") -> 
             "map_tokens": 512,
             "architect": True,
             "editor_model": "deepseek/deepseek-flash",
+            "plan_align": True,
             "test_cmd": test_cmd,
         }
     return {
@@ -285,6 +288,7 @@ def _resolve_tier_params(tier: str, test_cmd: str = None, message: str = "") -> 
         "map_tokens": 0,
         "architect": False,
         "editor_model": None,
+        "plan_align": False,
         "test_cmd": None,
     }
 
@@ -360,6 +364,8 @@ def run_dispatch(task_id: str, message: str, files: list[str], cwd: Path,
         resolved["thinking"] = thinking
     if reasoning_effort:
         resolved["reasoning_effort"] = reasoning_effort
+    effective_plan_align = plan_align or (bool(resolved.get("plan_align", False)) and not restore)
+    resolved["plan_align"] = effective_plan_align
 
     print(
         f"[DISPATCHER] Classified as TIER {resolved['tier_num']}: "
@@ -370,8 +376,8 @@ def run_dispatch(task_id: str, message: str, files: list[str], cwd: Path,
         print(f"[DISPATCHER] Tier key: {tier_name}")
         print("[DISPATCHER] Resolved parameters:")
         for key in ("model", "thinking", "reasoning_effort", "edit_format",
-                    "map_tokens", "architect", "editor_model", "test_cmd",
-                    "command", "query"):
+                    "map_tokens", "architect", "editor_model", "plan_align",
+                    "test_cmd", "command", "query"):
             if key in resolved:
                 print(f"  {key}: {resolved[key]}")
         print("[STATUS] DRY_RUN")
@@ -394,7 +400,7 @@ def run_dispatch(task_id: str, message: str, files: list[str], cwd: Path,
         thinking=resolved.get("thinking", "auto"),
         reasoning_effort=resolved.get("reasoning_effort"),
         map_tokens=resolved.get("map_tokens", 0),
-        plan_align=plan_align,
+        plan_align=effective_plan_align,
         tier=tier_name,
     )
 
@@ -462,66 +468,214 @@ def load_project_env(cwd: Path):
                     os.environ[k] = v
 
 
+def _parse_token_count(raw: str) -> float:
+    """Convert an Aider token count string (e.g. '2.5k', '150', '1.2M') to float."""
+    if not raw:
+        return 0.0
+    s = raw.strip()
+    mult = 1.0
+    if s[-1] in ("k", "K"):
+        mult = 1000.0
+        s = s[:-1]
+    elif s[-1] in ("m", "M"):
+        mult = 1_000_000.0
+        s = s[:-1]
+    try:
+        return float(s) * mult
+    except ValueError:
+        return 0.0
+
+
+def _format_token_count(val: float) -> str:
+    """Format a summed token count using Aider-style suffixes."""
+    if val >= 1_000_000:
+        return f"{val / 1_000_000:.1f}M"
+    if val >= 1000:
+        return f"{val / 1000:.1f}k"
+    return str(int(round(val)))
+
+
 def parse_cost_and_tokens(output: str):
-    """Extract token count (including cache writes/hits) and cost from Aider output."""
-    tokens_match = re.search(
+    """Extract token count (including cache writes/hits) and cost from Aider output.
+
+    In multi-call turns (e.g. --architect mode), sums per-message costs and tokens
+    and uses the final cumulative session cost.
+    """
+    from decimal import Decimal, InvalidOperation
+
+    token_matches = re.findall(
         r"Tokens:\s*([0-9.]+[kKmM]?)\s*sent"
         r"(?:,\s*([0-9.]+[kKmM]?)\s*cache write)?"
         r"(?:,\s*([0-9.]+[kKmM]?)\s*cache hit)?"
         r",\s*([0-9.]+[kKmM]?)\s*received",
-        output
+        output,
     )
-    cost_match = re.search(r"Cost:\s*\$([0-9.]+)\s*message,\s*\$([0-9.]+)\s*session", output)
-    
-    tokens_sent = tokens_match.group(1) if tokens_match else "unknown"
-    cache_write = tokens_match.group(2) if (tokens_match and tokens_match.group(2)) else "0"
-    cache_hit = tokens_match.group(3) if (tokens_match and tokens_match.group(3)) else "0"
-    tokens_rcvd = tokens_match.group(4) if tokens_match else "unknown"
-    cost_msg = cost_match.group(1) if cost_match else "unknown"
-    cost_session = cost_match.group(2) if cost_match else "unknown"
+    cost_matches = re.findall(r"Cost:\s*\$([0-9.]+)\s*message,\s*\$([0-9.]+)\s*session", output)
+
+    if not token_matches:
+        tokens_sent = tokens_rcvd = "unknown"
+        cache_write = cache_hit = "0"
+    elif len(token_matches) == 1:
+        m = token_matches[0]
+        tokens_sent = m[0]
+        cache_write = m[1] or "0"
+        cache_hit = m[2] or "0"
+        tokens_rcvd = m[3]
+    else:
+        tokens_sent = _format_token_count(sum(_parse_token_count(m[0]) for m in token_matches))
+        cw_sum = sum(_parse_token_count(m[1]) for m in token_matches if m[1])
+        ch_sum = sum(_parse_token_count(m[2]) for m in token_matches if m[2])
+        cache_write = _format_token_count(cw_sum) if cw_sum > 0 else "0"
+        cache_hit = _format_token_count(ch_sum) if ch_sum > 0 else "0"
+        tokens_rcvd = _format_token_count(sum(_parse_token_count(m[3]) for m in token_matches))
+
+    if not cost_matches:
+        cost_msg = cost_session = "unknown"
+    elif len(cost_matches) == 1:
+        cost_msg, cost_session = cost_matches[0]
+    else:
+        try:
+            total_msg = sum(Decimal(m[0]) for m in cost_matches)
+            cost_msg = format(total_msg, "f")
+        except InvalidOperation:
+            cost_msg = cost_matches[-1][0]
+        cost_session = cost_matches[-1][1]
+
     return tokens_sent, cache_write, cache_hit, tokens_rcvd, cost_msg, cost_session
+
+
+_CONTINUATION_TAG_RE = re.compile(
+    r"^\[(?:OPTIONS?|RECOMMENDATION|STAGE|CATEGORY|IMPACT):", re.IGNORECASE
+)
+_AIDER_FOOTER_RE = re.compile(r"^(?:Tokens:\s*[0-9]|Cost:\s*\$|Applied edit to )")
+_OPTION_LINE_RE = re.compile(r"^(?:[A-Z]\)\s+|Option\s+[A-Z]\b)", re.IGNORECASE)
+
+
+def _should_continue_after_blank(lines: list[str], idx: int, q_indent: int, in_options: bool) -> bool:
+    """Return True if a blank line inside a QUESTION block should not terminate it."""
+    for j in range(idx + 1, len(lines)):
+        nxt = lines[j]
+        nxt_trimmed = nxt.strip()
+        if not nxt_trimmed:
+            continue
+        if re.match(r"^\s*QUESTION:\s*", nxt):
+            return False
+        if _AIDER_FOOTER_RE.match(nxt_trimmed):
+            return False
+        if nxt_trimmed.startswith(("@@", "diff ", "<<<<<<<", "=======", ">>>>>>>")):
+            return False
+        if in_options:
+            return True
+        if _CONTINUATION_TAG_RE.match(nxt_trimmed):
+            return True
+        if nxt_trimmed.startswith(("- ", "* ")):
+            return True
+        if _OPTION_LINE_RE.match(nxt_trimmed):
+            return True
+        nxt_indent = len(nxt) - len(nxt.lstrip())
+        if nxt_indent > q_indent:
+            return True
+        return False
+    return False
 
 
 def extract_questions(output: str):
     """
     Extract questions while preventing false positives from code diffs or commit messages.
-    Filters out lines that are part of diff additions, deletions, unified headers,
-    or standalone fenced code blocks.
+    Preserves multi-line structured QUESTION blocks (blank lines, markdown bullets,
+    [OPTIONS: ...], [RECOMMENDATION: ...]) while ignoring standalone diffs and fences.
     """
     output = strip_thinking_block(output)
-    non_diff_lines = []
+    lines = output.splitlines()
+    questions = []
+    current_q = None
+    q_indent = 0
     fence_len = None
-    in_question = False
-    for line in output.splitlines():
+    in_options = False
+
+    def _update_options_state(trimmed_line: str):
+        nonlocal in_options
+        opt_pos = trimmed_line.upper().find("[OPTIONS:")
+        if opt_pos == -1:
+            opt_pos = trimmed_line.upper().find("[OPTION:")
+        if opt_pos != -1:
+            tail = trimmed_line[opt_pos + 1:]
+            in_options = "]" not in tail
+        elif in_options and "]" in trimmed_line:
+            in_options = False
+
+    def _flush_question():
+        nonlocal current_q, in_options
+        if current_q is not None:
+            joined = "\n".join(current_q).strip()
+            if joined:
+                questions.append(joined)
+        current_q = None
+        in_options = False
+
+    for i, line in enumerate(lines):
         trimmed = line.strip()
-        # Skip git / unified diff lines
-        if trimmed.startswith(("+", "-", "@@", "diff ", "---", "+++", "* ")):
-            continue
-        if trimmed.startswith(("<<<<<<<", "=======", ">>>>>>>")):
-            continue
         fence_match = re.match(r"^(`{3,})", trimmed)
+
+        if current_q is None:
+            if fence_match:
+                ticks = fence_match.group(1)
+                if fence_len is None:
+                    fence_len = len(ticks)
+                elif len(ticks) >= fence_len and trimmed == ticks:
+                    fence_len = None
+                continue
+            if fence_len is not None:
+                continue
+            if trimmed.startswith(("+", "-", "@@", "diff ", "---", "+++", "* ", "<<<<<<<", "=======", ">>>>>>>")):
+                continue
+            q_match = re.match(r"^(\s*)QUESTION:\s*(.*)$", line)
+            if q_match:
+                q_indent = len(q_match.group(1))
+                first_part = q_match.group(2).rstrip()
+                current_q = [first_part] if first_part else []
+                _update_options_state(trimmed)
+            continue
+
+        # Inside an active QUESTION block
         if fence_match:
             ticks = fence_match.group(1)
             if fence_len is None:
                 fence_len = len(ticks)
             elif len(ticks) >= fence_len and trimmed == ticks:
                 fence_len = None
-            if in_question:
-                non_diff_lines.append(line.rstrip())
+            current_q.append(line.rstrip())
             continue
-        if fence_len is not None and not in_question:
+
+        if fence_len is not None:
+            current_q.append(line.rstrip())
             continue
-        if re.match(r"^\s*QUESTION:\s*", line):
-            in_question = True
-        elif not trimmed and in_question and fence_len is None:
-            in_question = False
-        non_diff_lines.append(line.rstrip())
-        
-    filtered_text = "\n".join(non_diff_lines)
-    
-    # Match QUESTION: followed by text until an empty line or end of string
-    matches = re.findall(r"(?:^|\n)\s*QUESTION:\s*(.+?)(?=\n\s*\n|\Z)", filtered_text, re.DOTALL)
-    return [m.strip() for m in matches if m.strip()]
+
+        q_match = re.match(r"^(\s*)QUESTION:\s*(.*)$", line)
+        if q_match:
+            _flush_question()
+            q_indent = len(q_match.group(1))
+            first_part = q_match.group(2).rstrip()
+            current_q = [first_part] if first_part else []
+            _update_options_state(trimmed)
+            continue
+
+        if trimmed.startswith(("@@", "diff ", "<<<<<<<", "=======", ">>>>>>>")) or _AIDER_FOOTER_RE.match(trimmed):
+            _flush_question()
+            continue
+
+        if not trimmed:
+            if _should_continue_after_blank(lines, i, q_indent, in_options):
+                current_q.append("")
+            else:
+                _flush_question()
+            continue
+
+        current_q.append(line.rstrip())
+        _update_options_state(trimmed)
+
+    _flush_question()
+    return questions
 
 
 def parse_structured_question(raw_question: str, seq: int = 1) -> dict:
@@ -545,7 +699,10 @@ def parse_structured_question(raw_question: str, seq: int = 1) -> dict:
     opt_match = re.search(r"\[OPTIONS?:(.*?)\]", cleaned, re.IGNORECASE | re.DOTALL)
     if opt_match:
         options_span = opt_match.span()
-        for m in re.finditer(r"([A-Z])\)\s*([^\n\]]+)", opt_match.group(1)):
+        for m in re.finditer(
+            r"([A-Z])\)\s*(.+?)(?=(?:\s+[A-Z]\)\s|\n|\Z))",
+            opt_match.group(1),
+        ):
             options.append({"key": m.group(1), "summary": m.group(2).strip()})
 
     body = cleaned
@@ -584,18 +741,19 @@ def evaluate_escalation_threshold(question_event) -> str:
 
     lower = text.lower()
 
-    if impact == "LOW":
-        return "AUTO_SUPPRESS"
-    for phrase in AUTO_SUPPRESS_PHRASES:
-        if phrase in lower:
-            return "AUTO_SUPPRESS"
-
     if stage == "PLANNING":
         return "ESCALATE_PRINCIPAL"
     if category and category in ESCALATE_CATEGORIES:
         return "ESCALATE_PRINCIPAL"
     if impact == "HIGH":
         return "ESCALATE_PRINCIPAL"
+
+    if impact == "LOW":
+        return "AUTO_SUPPRESS"
+    for phrase in AUTO_SUPPRESS_PHRASES:
+        if phrase in lower:
+            return "AUTO_SUPPRESS"
+
     if text.strip():
         return "ESCALATE_PRINCIPAL"
     return "AUTO_SUPPRESS"
@@ -802,9 +960,63 @@ def create_task_worktree(task_id: str, cwd: Path, base_branch: str = None) -> tu
     return worktree_path, branch_name
 
 
+def _commit_worktree_changes_if_dirty(task_id: str, worktree_path: Path):
+    """Stage and commit any uncommitted edits in worktree_path before removing it."""
+    if not worktree_path.exists():
+        return
+    # Remove bridge-copied .env or ephemeral aider files if untracked so they are never committed
+    for ephemeral in (".env", ".aider.input.history", ".aider.chat.history.md"):
+        ep_path = worktree_path / ephemeral
+        if ep_path.exists():
+            tracked = subprocess.run(
+                ["git", "-C", str(worktree_path), "ls-files", "--error-unmatch", ephemeral],
+                capture_output=True, text=True,
+            )
+            if tracked.returncode != 0:
+                try:
+                    ep_path.unlink()
+                except OSError:
+                    pass
+    for cache_dir in worktree_path.glob(".aider.tags.cache*"):
+        tracked = subprocess.run(
+            ["git", "-C", str(worktree_path), "ls-files", "--error-unmatch", cache_dir.name],
+            capture_output=True, text=True,
+        )
+        if tracked.returncode != 0:
+            shutil.rmtree(cache_dir, ignore_errors=True)
+
+    status = subprocess.run(
+        ["git", "-C", str(worktree_path), "status", "--porcelain"],
+        capture_output=True, text=True,
+    )
+    if status.returncode == 0 and status.stdout.strip():
+        add_res = subprocess.run(
+            ["git", "-C", str(worktree_path), "add", "-A"],
+            capture_output=True, text=True,
+        )
+        if add_res.returncode != 0:
+            print(
+                f"[WORKTREE] Failed to stage changes in {worktree_path}: {add_res.stderr.strip()}",
+                file=sys.stderr,
+            )
+            return
+        commit_res = subprocess.run(
+            ["git", "-C", str(worktree_path), "commit", "-m", f"chore(aider): apply task {task_id} changes"],
+            capture_output=True, text=True,
+        )
+        if commit_res.returncode != 0:
+            print(
+                f"[WORKTREE] Failed to commit changes in {worktree_path}: {commit_res.stderr.strip()}",
+                file=sys.stderr,
+            )
+        else:
+            print(f"[WORKTREE] Committed uncommitted changes in {worktree_path}")
+
+
 def merge_and_remove_worktree(task_id: str, worktree_path: Path, branch_name: str,
                               cwd: Path, auto_merge: bool = True):
-    """Remove the worktree; if auto_merge, lock git, rebase if needed, merge, then delete branch."""
+    """Commit dirty edits, remove the worktree, and if auto_merge, rebase/merge/delete branch."""
+    _commit_worktree_changes_if_dirty(task_id, worktree_path)
     remove = subprocess.run(
         ["git", "worktree", "remove", "--force", str(worktree_path)],
         cwd=cwd, capture_output=True, text=True
@@ -856,6 +1068,7 @@ def merge_worktree_task(task_id: str, cwd: Path):
     worktree_path = cwd / ".worktrees" / task_id
     branch_name = f"task/{task_id}"
     if worktree_path.exists():
+        _commit_worktree_changes_if_dirty(task_id, worktree_path)
         subprocess.run(
             ["git", "worktree", "remove", "--force", str(worktree_path)],
             cwd=cwd, capture_output=True, text=True
@@ -968,7 +1181,7 @@ def run_turn(task_id: str, message: str, files: list[str], cwd: Path,
                      read_files=read_files, restore=restore, model=model,
                      lint_cmd=lint_cmd, test_cmd=test_cmd, dry_run=dry_run,
                      architect=architect, editor_model=editor_model,
-                     worktree=False, verbose=verbose,
+                     worktree=False, auto_merge=auto_merge, verbose=verbose,
                      thinking=thinking, reasoning_effort=reasoning_effort,
                      map_tokens=map_tokens, plan_align=plan_align,
                      session_root=session_root, tier=tier)
@@ -1085,7 +1298,12 @@ def run_turn(task_id: str, message: str, files: list[str], cwd: Path,
     cmd = [
         "uvx", "--from", "aider-chat", "aider",
         "--model", model,
-        "--edit-format", "diff",
+    ]
+    if plan_align:
+        cmd.extend(["--chat-mode", "ask"])
+    else:
+        cmd.extend(["--edit-format", "diff"])
+    cmd.extend([
         "--cache-prompts",
         "--cache-keepalive-pings", "6",
         "--map-tokens", str(map_tokens),
@@ -1098,7 +1316,7 @@ def run_turn(task_id: str, message: str, files: list[str], cwd: Path,
         "--yes-always",
         "--no-auto-commits",
         "--message", full_message
-    ]
+    ])
 
     # Dynamic .aiderignore shield for secrets and cache artifacts
     ignore_path = create_ephemeral_aiderignore(cwd)
@@ -1109,22 +1327,26 @@ def run_turn(task_id: str, message: str, files: list[str], cwd: Path,
     if architect and not resolved_editor_model and model == "deepseek/deepseek-reasoner":
         resolved_editor_model = "deepseek/deepseek-flash"
 
+    # During Stage 1 planning (--chat-mode ask), suppress architect/editor & auto-lint/test
+    effective_architect = architect and not plan_align
+    effective_editor_model = None if plan_align else resolved_editor_model
+
     # Ephemeral model settings for explicit prompt caching and diff format
     model_settings_path = create_ephemeral_model_settings(
-        cwd, model, editor_model=resolved_editor_model,
-        architect=architect, thinking=thinking, reasoning_effort=reasoning_effort
+        cwd, model, editor_model=effective_editor_model,
+        architect=effective_architect, thinking=thinking, reasoning_effort=reasoning_effort
     )
     if model_settings_path:
         cmd.extend(["--model-settings-file", str(model_settings_path)])
 
-    # Auto-lint / syntax check support
-    resolved_lint_cmd = detect_lint_cmd(files, lint_cmd)
-    if resolved_lint_cmd:
-        cmd.extend(["--auto-lint", "--lint-cmd", resolved_lint_cmd])
+    # Auto-lint / syntax check and closed-loop TDD (disabled during read-only Stage 1 planning)
+    if not plan_align:
+        resolved_lint_cmd = detect_lint_cmd(files, lint_cmd)
+        if resolved_lint_cmd:
+            cmd.extend(["--auto-lint", "--lint-cmd", resolved_lint_cmd])
 
-    # Closed-loop TDD: let Aider run tests and self-heal failing assertions
-    if test_cmd:
-        cmd.extend(["--auto-test", "--test-cmd", test_cmd])
+        if test_cmd:
+            cmd.extend(["--auto-test", "--test-cmd", test_cmd])
 
     # DeepSeek dynamic thinking / reasoning controls
     if thinking == "off":
@@ -1137,10 +1359,10 @@ def run_turn(task_id: str, message: str, files: list[str], cwd: Path,
         cmd.append("--dry-run")
 
     # Architect mode (two-model: architect + editor)
-    if architect:
+    if effective_architect:
         cmd.append("--architect")
-    if resolved_editor_model:
-        cmd.extend(["--editor-model", resolved_editor_model])
+    if effective_editor_model:
+        cmd.extend(["--editor-model", effective_editor_model])
     
     # Fallback if no git repo
     if not (cwd / ".git").exists():
@@ -1354,6 +1576,19 @@ def reply_session(task_id: str, answer: str, cwd: Path,
         print(f"[ERROR] Failed to parse state.json: {e}", file=sys.stderr)
         sys.exit(1)
 
+    effective_cwd = cwd
+    if state.get("worktree"):
+        wp_raw = state.get("worktree_path")
+        wp = Path(wp_raw) if wp_raw else None
+        if not wp or not wp.exists():
+            print(
+                f"[ERROR] Worktree for task '{task_id}' not found at {wp_raw!r}. "
+                f"Cannot resume worktree session in main repo root.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        effective_cwd = wp
+
     pending_qid = state.get("pending_qid")
     inbox_file = session_dir / "inbox.jsonl"
     inbox_file.touch(exist_ok=True)
@@ -1374,15 +1609,14 @@ def reply_session(task_id: str, answer: str, cwd: Path,
         state["stage"] = "IMPLEMENTATION"
     state_file.write_text(json.dumps(state, indent=2))
 
-    effective_cwd = cwd
-    if state.get("worktree") and state.get("worktree_path"):
-        wp = Path(state["worktree_path"])
-        if wp.exists():
-            effective_cwd = wp
+    if approved_option:
+        decision_msg = f"Architect Decision (Option {approved_option}): {answer}. Proceed with implementation."
+    else:
+        decision_msg = f"Architect Decision: {answer}. Proceed with implementation."
 
     run_turn(
         task_id,
-        f"Architect Decision: {answer}. Proceed with implementation.",
+        decision_msg,
         state.get("files") or [],
         effective_cwd,
         read_files=state.get("read_files") or [],

@@ -61,6 +61,19 @@ def test_parse_structured_question_tags():
     assert ev["recommendation"] == "Option A"
     assert ev["ts"].endswith("Z")
 
+    # Single-line [OPTIONS: A) ... B) ...] must also split cleanly
+    inline = (
+        "[STAGE: PLANNING] [CATEGORY: ARCHITECTURE] [IMPACT: HIGH]\n"
+        "Store choice?\n"
+        "[OPTIONS: A) In-memory RLock + dict B) sqlite3 WAL store]\n"
+        "[RECOMMENDATION: Option A]"
+    )
+    ev_inline = aider_bridge.parse_structured_question(inline, seq=8)
+    assert [(o["key"], o["summary"]) for o in ev_inline["options"]] == [
+        ("A", "In-memory RLock + dict"),
+        ("B", "sqlite3 WAL store"),
+    ]
+
 
 def test_evaluate_escalation_threshold():
     assert aider_bridge.evaluate_escalation_threshold("Should I proceed?") == "AUTO_SUPPRESS"
@@ -302,3 +315,178 @@ def test_dispatch_plan_align_wiring(monkeypatch):
     ])
     aider_bridge.main()
     assert captured["kwargs"].get("plan_align") is True
+
+
+def test_extract_questions_preserves_multiline_structured_block():
+    output = (
+        "Aider v0.86.2\n"
+        "QUESTION: [STAGE: PLANNING] [CATEGORY: ARCHITECTURE] [IMPACT: HIGH]\n"
+        "Which persistence backend should we use for session tokens?\n"
+        "\n"
+        "- Local file store keeps deployment simple\n"
+        "* Redis enables multi-worker horizontal scaling\n"
+        "\n"
+        "[OPTIONS:\n"
+        "  A) Local JSON store\n"
+        "  B) Redis cluster\n"
+        "]\n"
+        "\n"
+        "[RECOMMENDATION: Option A for single-node CLI]\n"
+        "\n"
+        "Tokens: 1.5k sent, 120 received. Cost: $0.00050 message, $0.00050 session.\n"
+    )
+    qs = aider_bridge.extract_questions(output)
+    assert len(qs) == 1
+    q = qs[0]
+    assert "- Local file store" in q
+    assert "* Redis enables" in q
+    assert "[OPTIONS:" in q
+    assert "A) Local JSON store" in q
+    assert "B) Redis cluster" in q
+    assert "[RECOMMENDATION: Option A for single-node CLI]" in q
+    assert "Tokens:" not in q
+
+    ev = aider_bridge.parse_structured_question(q, seq=1)
+    assert ev["stage"] == "PLANNING"
+    assert ev["category"] == "ARCHITECTURE"
+    assert ev["impact"] == "HIGH"
+    assert [o["key"] for o in ev["options"]] == ["A", "B"]
+    assert ev["recommendation"] == "Option A for single-node CLI"
+
+
+def test_evaluate_escalation_threshold_precedence_over_polite_phrases():
+    assert aider_bridge.evaluate_escalation_threshold({
+        "question": "Would you like me to proceed with JWT or Redis?",
+        "stage": "PLANNING",
+    }) == "ESCALATE_PRINCIPAL"
+    assert aider_bridge.evaluate_escalation_threshold({
+        "question": "Should I proceed with Option A?",
+        "category": "ARCHITECTURE",
+    }) == "ESCALATE_PRINCIPAL"
+    assert aider_bridge.evaluate_escalation_threshold({
+        "question": "Would you like me to rewrite the lock?",
+        "impact": "HIGH",
+    }) == "ESCALATE_PRINCIPAL"
+    # Polite implementation-stage low/unspecified question is still suppressed
+    assert aider_bridge.evaluate_escalation_threshold({
+        "question": "Would you like me to format docstrings?",
+        "stage": "IMPLEMENTATION",
+    }) == "AUTO_SUPPRESS"
+
+
+def test_plan_align_uses_read_only_ask_mode_without_architect_or_tests(monkeypatch):
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmppath = Path(tmpdir)
+        monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
+        captured = _mock_subprocess(
+            monkeypatch,
+            aider_stdout_for_uvx=(
+                "QUESTION: [STAGE: PLANNING] [CATEGORY: ARCHITECTURE] [IMPACT: HIGH]\n"
+                "Choose layout?\n"
+                "[OPTIONS:\n  A) Split modules\n  B) Single file\n]\n"
+                "[RECOMMENDATION: Option A]\n"
+            ),
+        )
+        monkeypatch.setattr(sys, "argv", [
+            "aider_bridge.py", "turn", "--task-id", "plan_ro",
+            "--message", "Plan refactor", "--files", "app.py",
+            "--model", "deepseek/deepseek-reasoner", "--architect",
+            "--test-cmd", "pytest -q", "--plan-align", "--cwd", str(tmppath),
+        ])
+        with pytest.raises(SystemExit) as exc:
+            aider_bridge.main()
+        assert exc.value.code == 10
+
+        cmd = captured["cmd"]
+        assert "--chat-mode" in cmd
+        assert cmd[cmd.index("--chat-mode") + 1] == "ask"
+        assert "--edit-format" not in cmd
+        assert "--architect" not in cmd
+        assert "--editor-model" not in cmd
+        assert "--auto-test" not in cmd
+
+        state = json.loads((tmppath / ".aider-sessions" / "plan_ro" / "state.json").read_text())
+        assert state["architect"] is True
+        assert state["stage"] == "PLANNING"
+
+
+def test_dispatch_auto_plan_align_only_for_tier3(monkeypatch):
+    captured = {}
+
+    def fake_run_turn(task_id, message, files, cwd, **kwargs):
+        captured[task_id] = kwargs
+
+    monkeypatch.setattr(aider_bridge, "run_turn", fake_run_turn)
+
+    # Tier 3 (architect) auto-enables plan_align
+    monkeypatch.setattr(sys, "argv", [
+        "aider_bridge.py", "dispatch", "--task-id", "t3_auto",
+        "--message", "Refactor the concurrency lock architecture", "--files", "lock.py",
+        "--cwd", ".",
+    ])
+    aider_bridge.main()
+    assert captured["t3_auto"]["plan_align"] is True
+
+    # Tier 1 (patch) keeps plan_align=False
+    monkeypatch.setattr(sys, "argv", [
+        "aider_bridge.py", "dispatch", "--task-id", "t1_auto",
+        "--message", "Fix typo in README", "--files", "README.md",
+        "--cwd", ".",
+    ])
+    aider_bridge.main()
+    assert captured["t1_auto"]["plan_align"] is False
+
+    # Tier 2 (surgical) keeps plan_align=False
+    monkeypatch.setattr(sys, "argv", [
+        "aider_bridge.py", "dispatch", "--task-id", "t2_auto",
+        "--message", "Implement add function", "--files", "calc.py",
+        "--test-cmd", "pytest -q", "--cwd", ".",
+    ])
+    aider_bridge.main()
+    assert captured["t2_auto"]["plan_align"] is False
+
+
+def test_reply_includes_approved_option_and_fails_on_missing_worktree(monkeypatch):
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmppath = Path(tmpdir)
+        sd = tmppath / ".aider-sessions" / "rep_opt"
+        sd.mkdir(parents=True)
+        (sd / "state.json").write_text(json.dumps({
+            "task_id": "rep_opt", "stage": "PLANNING", "status": "AWAITING_PLAN_APPROVAL",
+            "pending_qid": "q_1234", "files": ["app.py"], "read_files": [],
+            "model": "deepseek/deepseek-reasoner", "editor_model": "deepseek/deepseek-flash",
+            "architect": True, "test_cmd": None, "lint_cmd": None,
+            "thinking": "on", "reasoning_effort": "high", "map_tokens": 512,
+            "turn_count": 1, "auto_merge": True, "worktree": False,
+        }))
+        (sd / "chat_history.md").touch()
+        monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
+        captured = _mock_subprocess(monkeypatch)
+        monkeypatch.setattr(sys, "argv", [
+            "aider_bridge.py", "reply", "--task-id", "rep_opt",
+            "--approved-option", "A", "--answer", "Use local store",
+            "--cwd", str(tmppath),
+        ])
+        with pytest.raises(SystemExit) as exc:
+            aider_bridge.main()
+        assert exc.value.code == 0
+        cmd = captured["cmd"]
+        msg = cmd[cmd.index("--message") + 1]
+        assert "Architect Decision (Option A): Use local store. Proceed with implementation." == msg
+
+    # Missing worktree must fail with exit 1 instead of falling back to main repo root
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmppath = Path(tmpdir)
+        sd = tmppath / ".aider-sessions" / "rep_missing_wt"
+        sd.mkdir(parents=True)
+        missing_wt = tmppath / ".worktrees" / "rep_missing_wt"
+        (sd / "state.json").write_text(json.dumps({
+            "task_id": "rep_missing_wt", "stage": "PLANNING", "status": "AWAITING_PLAN_APPROVAL",
+            "pending_qid": "q_9999", "worktree": True, "worktree_path": str(missing_wt),
+        }))
+        with pytest.raises(SystemExit) as exc:
+            aider_bridge.reply_session("rep_missing_wt", "Proceed", tmppath, approved_option="A")
+        assert exc.value.code == 1
+        # State must remain intact when failing pre-flight
+        state_after = json.loads((sd / "state.json").read_text())
+        assert state_after["status"] == "AWAITING_PLAN_APPROVAL"

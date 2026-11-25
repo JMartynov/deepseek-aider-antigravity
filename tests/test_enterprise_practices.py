@@ -841,3 +841,82 @@ def test_worktree_forwards_advanced_flags(monkeypatch):
         assert "--architect" in cmd
         idx = cmd.index("--editor-model")
         assert cmd[idx + 1] == "deepseek/deepseek-flash"
+
+
+def test_worktree_uncommitted_edits_preserved_on_merge_worktree_task():
+    """Uncommitted edits in .worktrees/<task_id> (--no-auto-commits) must be committed and merged."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmppath = Path(tmpdir)
+        subprocess.run(["git", "init", "-b", "main"], cwd=tmppath, check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.name", "TestUser"], cwd=tmppath, check=True)
+        subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=tmppath, check=True)
+        (tmppath / "app.py").write_text("def greet():\n    return 'helo'\n")
+        subprocess.run(["git", "add", "."], cwd=tmppath, check=True)
+        subprocess.run(["git", "commit", "-m", "Initial commit"], cwd=tmppath, check=True)
+        # Untracked .env in main repo (copied to worktree during run_turn)
+        (tmppath / ".env").write_text("DEEPSEEK_API_KEY=sk-secret\n")
+
+        wt_path, branch = aider_bridge.create_task_worktree("uncommitted_task", tmppath)
+        (wt_path / ".env").write_text("DEEPSEEK_API_KEY=sk-secret\n")
+        # Simulate Aider --no-auto-commits edits (uncommitted!)
+        (wt_path / "app.py").write_text("def greet():\n    return 'hello'\n")
+        (wt_path / "new_mod.py").write_text("VALUE = 123\n")
+
+        aider_bridge.merge_worktree_task("uncommitted_task", tmppath)
+
+        assert not wt_path.exists()
+        assert "return 'hello'" in (tmppath / "app.py").read_text()
+        assert (tmppath / "new_mod.py").read_text() == "VALUE = 123\n"
+        # .env must NOT be tracked/committed on main
+        ls_env = subprocess.run(["git", "ls-files", ".env"], cwd=tmppath, capture_output=True, text=True)
+        assert ls_env.stdout.strip() == ""
+
+
+def test_worktree_uncommitted_edits_preserved_on_auto_merge():
+    """merge_and_remove_worktree must also commit dirty worktree edits before removing worktree."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmppath = Path(tmpdir)
+        subprocess.run(["git", "init", "-b", "main"], cwd=tmppath, check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.name", "TestUser"], cwd=tmppath, check=True)
+        subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=tmppath, check=True)
+        (tmppath / "README.md").write_text("teh docs\n")
+        subprocess.run(["git", "add", "."], cwd=tmppath, check=True)
+        subprocess.run(["git", "commit", "-m", "Initial"], cwd=tmppath, check=True)
+
+        wt_path, branch = aider_bridge.create_task_worktree("auto_dirty", tmppath)
+        (wt_path / "README.md").write_text("the docs\n")  # uncommitted
+
+        aider_bridge.merge_and_remove_worktree("auto_dirty", wt_path, branch, tmppath, auto_merge=True)
+        assert not wt_path.exists()
+        assert (tmppath / "README.md").read_text() == "the docs\n"
+
+
+def test_worktree_recursion_records_auto_merge_false(monkeypatch):
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmppath = Path(tmpdir)
+        _invoke_turn_and_capture(
+            monkeypatch, tmppath,
+            ["--task-id", "wt_am", "--message", "m", "--files", "foo.py",
+             "--worktree", "--no-auto-merge"],
+        )
+        state = json.loads((tmppath / ".aider-sessions" / "wt_am" / "state.json").read_text())
+        assert state["worktree"] is True
+        assert state["auto_merge"] is False
+
+
+def test_parse_cost_and_tokens_architect_multi_call():
+    output = (
+        "Architect model:\n"
+        "Tokens: 4.0k sent, 1.0k cache write, 2.0k cache hit, 400 received. "
+        "Cost: $0.00120 message, $0.00120 session.\n"
+        "Editor model:\n"
+        "Tokens: 2.5k sent, 100 received. "
+        "Cost: $0.00035 message, $0.00155 session.\n"
+    )
+    sent, write, hit, rcvd, cost_m, cost_s = aider_bridge.parse_cost_and_tokens(output)
+    assert sent == "6.5k"
+    assert write == "1.0k"
+    assert hit == "2.0k"
+    assert rcvd == "500"
+    assert cost_m == "0.00155"
+    assert cost_s == "0.00155"
