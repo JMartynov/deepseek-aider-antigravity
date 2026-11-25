@@ -16,6 +16,8 @@ import shutil
 import subprocess
 import urllib.request
 import urllib.error
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from contextlib import contextmanager
 
@@ -212,6 +214,23 @@ DOC_CONFIG_EXTENSIONS = (
     ".md", ".txt", ".rst", ".toml", ".yaml", ".yml", ".json", ".ini", ".cfg",
 )
 
+AUTO_SUPPRESS_PHRASES = (
+    "should i proceed",
+    "would you like me to",
+    "should i format docstrings",
+    "shall i proceed",
+    "do you want me to",
+    "should i continue",
+    "ready to proceed",
+    "may i proceed",
+)
+
+ESCALATE_CATEGORIES = frozenset({
+    "ARCHITECTURE", "SCHEMA", "API_CONTRACT", "CONCURRENCY", "TRADEOFF",
+    "BREAKING_CHANGE", "SECURITY", "UNRESOLVABLE_FAILURE",
+    "UNRESOLVED_FAILURE", "AMBIGUITY",
+})
+
 
 def _resolve_tier_params(tier: str, test_cmd: str = None, message: str = "") -> dict:
     """Build the resolved Aider/search parameter dict for a given precision tier."""
@@ -325,7 +344,8 @@ def run_dispatch(task_id: str, message: str, files: list[str], cwd: Path,
                  tier: str = "auto", thinking: str = "auto",
                  reasoning_effort: str = None, dry_run: bool = False,
                  worktree: bool = False, auto_merge: bool = True,
-                 verbose: bool = False):
+                 verbose: bool = False, plan_align: bool = False,
+                 restore: bool = False):
     """
     Classify a task into its optimal precision tier and dispatch it to the
     matching model/thinking/edit-format configuration (or DeepSeek search).
@@ -363,7 +383,7 @@ def run_dispatch(task_id: str, message: str, files: list[str], cwd: Path,
 
     run_turn(
         task_id, message, files, cwd,
-        read_files=read_files, restore=False,
+        read_files=read_files, restore=restore,
         model=resolved.get("model") or "deepseek/deepseek-flash",
         lint_cmd=None,
         test_cmd=resolved.get("test_cmd"),
@@ -374,6 +394,8 @@ def run_dispatch(task_id: str, message: str, files: list[str], cwd: Path,
         thinking=resolved.get("thinking", "auto"),
         reasoning_effort=resolved.get("reasoning_effort"),
         map_tokens=resolved.get("map_tokens", 0),
+        plan_align=plan_align,
+        tier=tier_name,
     )
 
 
@@ -421,6 +443,11 @@ def run_search(query: str, cwd: Path, count: int = 5,
         print(format_search_results(data, need_content=need_content))
 
 
+def get_session_dir(task_id: str, cwd: Path) -> Path:
+    """Return the structured session directory for a task."""
+    return cwd / ".aider-sessions" / task_id
+
+
 def load_project_env(cwd: Path):
     """Load DEEPSEEK_API_KEY from project .env file only."""
     env_file = cwd / ".env"
@@ -458,9 +485,13 @@ def parse_cost_and_tokens(output: str):
 def extract_questions(output: str):
     """
     Extract questions while preventing false positives from code diffs or commit messages.
-    Filters out lines that are part of diff additions, deletions, or unified headers.
+    Filters out lines that are part of diff additions, deletions, unified headers,
+    or standalone fenced code blocks.
     """
+    output = strip_thinking_block(output)
     non_diff_lines = []
+    fence_len = None
+    in_question = False
     for line in output.splitlines():
         trimmed = line.strip()
         # Skip git / unified diff lines
@@ -468,6 +499,22 @@ def extract_questions(output: str):
             continue
         if trimmed.startswith(("<<<<<<<", "=======", ">>>>>>>")):
             continue
+        fence_match = re.match(r"^(`{3,})", trimmed)
+        if fence_match:
+            ticks = fence_match.group(1)
+            if fence_len is None:
+                fence_len = len(ticks)
+            elif len(ticks) >= fence_len and trimmed == ticks:
+                fence_len = None
+            if in_question:
+                non_diff_lines.append(line.rstrip())
+            continue
+        if fence_len is not None and not in_question:
+            continue
+        if re.match(r"^\s*QUESTION:\s*", line):
+            in_question = True
+        elif not trimmed and in_question and fence_len is None:
+            in_question = False
         non_diff_lines.append(line.rstrip())
         
     filtered_text = "\n".join(non_diff_lines)
@@ -475,6 +522,83 @@ def extract_questions(output: str):
     # Match QUESTION: followed by text until an empty line or end of string
     matches = re.findall(r"(?:^|\n)\s*QUESTION:\s*(.+?)(?=\n\s*\n|\Z)", filtered_text, re.DOTALL)
     return [m.strip() for m in matches if m.strip()]
+
+
+def parse_structured_question(raw_question: str, seq: int = 1) -> dict:
+    """Parse a structured QUESTION block into a structured event dict."""
+    cleaned = (raw_question or "").strip()
+
+    stage_match = re.search(r"\[STAGE:\s*([^\]]+)\]", cleaned, re.IGNORECASE)
+    stage = stage_match.group(1).strip().upper() if stage_match else "IMPLEMENTATION"
+
+    category_match = re.search(r"\[CATEGORY:\s*([^\]]+)\]", cleaned, re.IGNORECASE)
+    category = category_match.group(1).strip().upper() if category_match else None
+
+    impact_match = re.search(r"\[IMPACT:\s*([^\]]+)\]", cleaned, re.IGNORECASE)
+    impact = impact_match.group(1).strip().upper() if impact_match else None
+
+    rec_match = re.search(r"\[RECOMMENDATION:\s*([^\]]+)\]", cleaned, re.IGNORECASE)
+    recommendation = rec_match.group(1).strip() if rec_match else None
+
+    options = []
+    options_span = None
+    opt_match = re.search(r"\[OPTIONS?:(.*?)\]", cleaned, re.IGNORECASE | re.DOTALL)
+    if opt_match:
+        options_span = opt_match.span()
+        for m in re.finditer(r"([A-Z])\)\s*([^\n\]]+)", opt_match.group(1)):
+            options.append({"key": m.group(1), "summary": m.group(2).strip()})
+
+    body = cleaned
+    if options_span:
+        body = body[:options_span[0]] + body[options_span[1]:]
+    body = re.sub(r"\[(?:STAGE|CATEGORY|IMPACT|RECOMMENDATION):[^\]]*\]", "", body, flags=re.IGNORECASE)
+    body = re.sub(r"\[OPTIONS?:[^\]]*\]", "", body, flags=re.IGNORECASE)
+    body = body.strip()
+
+    return {
+        "seq": seq,
+        "qid": f"q_{uuid.uuid4().hex[:8]}",
+        "type": "question",
+        "stage": stage,
+        "category": category,
+        "impact": impact,
+        "blocking": True,
+        "question": body or cleaned,
+        "options": options,
+        "recommendation": recommendation,
+        "suppressed": False,
+        "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+
+
+def evaluate_escalation_threshold(question_event) -> str:
+    """Return 'AUTO_SUPPRESS' or 'ESCALATE_PRINCIPAL' for a parsed question event."""
+    if isinstance(question_event, str):
+        text = question_event
+        stage = category = impact = None
+    else:
+        text = question_event.get("question") or ""
+        stage = (question_event.get("stage") or "").upper() or None
+        category = (question_event.get("category") or "").upper() or None
+        impact = (question_event.get("impact") or "").upper() or None
+
+    lower = text.lower()
+
+    if impact == "LOW":
+        return "AUTO_SUPPRESS"
+    for phrase in AUTO_SUPPRESS_PHRASES:
+        if phrase in lower:
+            return "AUTO_SUPPRESS"
+
+    if stage == "PLANNING":
+        return "ESCALATE_PRINCIPAL"
+    if category and category in ESCALATE_CATEGORIES:
+        return "ESCALATE_PRINCIPAL"
+    if impact == "HIGH":
+        return "ESCALATE_PRINCIPAL"
+    if text.strip():
+        return "ESCALATE_PRINCIPAL"
+    return "AUTO_SUPPRESS"
 
 
 def check_diff_applied_successfully(output: str):
@@ -504,6 +628,7 @@ def create_ephemeral_aiderignore(cwd: Path):
         ".pytest_cache/",
         ".cache/",
         "node_modules/",
+        ".aider-sessions/",
     ]
     ignore_path.write_text("\n".join(patterns) + "\n")
     return ignore_path
@@ -712,6 +837,22 @@ def merge_and_remove_worktree(task_id: str, worktree_path: Path, branch_name: st
 
 def merge_worktree_task(task_id: str, cwd: Path):
     """Explicitly merge and cleanup an isolated task worktree under mutex protection."""
+    # Strict safety merge guard (exit 5)
+    state_path = get_session_dir(task_id, cwd) / "state.json"
+    if state_path.exists():
+        try:
+            guard_state = json.loads(state_path.read_text() or "{}")
+        except Exception:
+            guard_state = {}
+        status = (guard_state.get("status") or "").upper()
+        if status.startswith("AWAITING_"):
+            print(
+                f"[ERROR] Cannot merge worktree for task '{task_id}': status={status}. "
+                f"Resolve the pending question via 'reply --task-id {task_id} --answer ...' first.",
+                file=sys.stderr,
+            )
+            sys.exit(5)
+
     worktree_path = cwd / ".worktrees" / task_id
     branch_name = f"task/{task_id}"
     if worktree_path.exists():
@@ -805,14 +946,18 @@ def run_preflight_checks(read_files: list[str], cwd: Path):
         sys.exit(14)
 
 
-def run_turn(task_id: str, message: str, files: list[str], cwd: Path, 
-             read_files: list[str] = None, restore: bool = False, 
+def run_turn(task_id: str, message: str, files: list[str], cwd: Path,
+             read_files: list[str] = None, restore: bool = False,
              model: str = "deepseek/deepseek-flash", lint_cmd: str = None,
              test_cmd: str = None, dry_run: bool = False,
              architect: bool = False, editor_model: str = None,
              worktree: bool = False, auto_merge: bool = True,
              verbose: bool = False, thinking: str = "auto",
-             reasoning_effort: str = None, map_tokens: int = 0):
+             reasoning_effort: str = None, map_tokens: int = 0,
+             plan_align: bool = False, session_root: Path = None,
+             tier: str = None):
+    session_root = session_root or cwd
+
     if worktree:
         worktree_path, branch_name = create_task_worktree(task_id, cwd)
         env_src = cwd / ".env"
@@ -825,7 +970,8 @@ def run_turn(task_id: str, message: str, files: list[str], cwd: Path,
                      architect=architect, editor_model=editor_model,
                      worktree=False, verbose=verbose,
                      thinking=thinking, reasoning_effort=reasoning_effort,
-                     map_tokens=map_tokens)
+                     map_tokens=map_tokens, plan_align=plan_align,
+                     session_root=session_root, tier=tier)
         except SystemExit as e:
             code = e.code if isinstance(e.code, int) else (0 if e.code is None else 1)
             if code == 0:
@@ -855,22 +1001,86 @@ def run_turn(task_id: str, message: str, files: list[str], cwd: Path,
     if not os.environ.get("DEEPSEEK_API_KEY"):
         print("[ERROR] DEEPSEEK_API_KEY not found in project .env file!", file=sys.stderr)
         sys.exit(1)
-        
-    session_file = cwd / f".aider.session_{task_id}.md"
-    
-    # Create parent directories for any new target files
+
+    # --- Structured session directory management ---
+    session_dir = get_session_dir(task_id, session_root)
+    session_dir.mkdir(parents=True, exist_ok=True)
+    state_file = session_dir / "state.json"
+    outbox_file = session_dir / "outbox.jsonl"
+    inbox_file = session_dir / "inbox.jsonl"
+    for aux in (outbox_file, inbox_file):
+        if not aux.exists():
+            aux.touch()
+
+    state = {}
+    if state_file.exists():
+        try:
+            state = json.loads(state_file.read_text() or "{}")
+        except Exception:
+            state = {}
+
+    turn_count = int(state.get("turn_count", 0)) + 1
+    state["task_id"] = task_id
+    state["turn_count"] = turn_count
+    state["files"] = list(files or [])
+    state["read_files"] = list(read_files or [])
+    state["model"] = model
+    state["editor_model"] = editor_model
+    state["architect"] = bool(architect)
+    state["test_cmd"] = test_cmd
+    state["lint_cmd"] = lint_cmd
+    state["thinking"] = thinking
+    state["reasoning_effort"] = reasoning_effort
+    state["map_tokens"] = int(map_tokens)
+    state["auto_merge"] = bool(auto_merge)
+    if tier:
+        state["tier"] = tier
+    else:
+        state.setdefault("tier", None)
+    if ".worktrees" in cwd.parts:
+        state["worktree"] = True
+        state["worktree_path"] = str(cwd)
+        state["branch"] = f"task/{task_id}"
+    else:
+        state.setdefault("worktree", False)
+    if plan_align and not restore:
+        state["stage"] = "PLANNING"
+    if not state.get("stage"):
+        state["stage"] = "IMPLEMENTATION"
+    state["status"] = "RUNNING"
+    state["last_cache_ping_ts"] = int(time.time())
+    state["suppressed_count"] = int(state.get("suppressed_count", 0))
+    state.setdefault("pending_qid", None)
+    state_file.write_text(json.dumps(state, indent=2))
+
+    session_file = session_dir / "chat_history.md"
+
+    # Create parent directories for any new target files (also creates mocked worktree dirs)
     for f in (files or []):
         target_path = cwd / f
         target_path.parent.mkdir(parents=True, exist_ok=True)
-    
+
     system_rules = (
         "IMPORTANT RULES: Be extremely concise. Output only surgical unified diffs. "
         "Do NOT write conversational filler or explanations. "
         "If any specification, signature, type, or requirement is missing or ambiguous, "
         "DO NOT GUESS and DO NOT modify code. Immediately output 'QUESTION: <your concise question>' and stop."
     )
-    
-    full_message = f"{system_rules}\n\nTask: {message}"
+    planning_rules = (
+        "STAGE 1: PLANNING ONLY. Do NOT edit or modify any files in this turn. "
+        "Analyze the scope of the task, propose architectural options, and surface trade-offs. "
+        "When you need an architectural decision, output "
+        "'QUESTION: [STAGE: PLANNING] [CATEGORY: ARCHITECTURE] [IMPACT: HIGH] <inquiry>' "
+        "followed by [OPTIONS: A) ... B) ...] and [RECOMMENDATION: ...], then stop."
+    )
+
+    # Prefix-cache preservation: never re-prepend system_rules on restore
+    if restore:
+        full_message = message
+    elif plan_align:
+        full_message = f"{system_rules}\n\n{planning_rules}\n\nTask: {message}"
+    else:
+        full_message = f"{system_rules}\n\nTask: {message}"
     
     cmd = [
         "uvx", "--from", "aider-chat", "aider",
@@ -947,7 +1157,7 @@ def run_turn(task_id: str, message: str, files: list[str], cwd: Path,
     for f in (files or []):
         cmd.append(f)
         
-    print(f"--- Running Aider Turn [Task: {task_id}] (restore={restore}) ---")
+    print(f"--- Running Aider Turn [Task: {task_id}] (restore={restore}, plan_align={plan_align}) ---")
     try:
         proc = subprocess.run(
             cmd,
@@ -957,6 +1167,8 @@ def run_turn(task_id: str, message: str, files: list[str], cwd: Path,
         )
     except Exception as e:
         rollback_target_files(files, cwd)
+        state["status"] = "FAILED"
+        state_file.write_text(json.dumps(state, indent=2))
         print(f"[ERROR] Aider invocation failed: {e}", file=sys.stderr)
         print("[STATUS] AIDER_INVOCATION_FAILED")
         sys.exit(13)
@@ -988,38 +1200,209 @@ def run_turn(task_id: str, message: str, files: list[str], cwd: Path,
     print(f" • Live API Balance: {balance_str}")
     print("=" * 60)
     
-    # Check for QUESTION: stop-word outside code diffs
+    # --- Anti-noise threshold gate for intercepted questions ---
     questions = extract_questions(combined_output)
     if questions:
-        print(f"\n[INTERCEPT] Sub-agent paused with {len(questions)} question(s):")
-        for idx, q in enumerate(questions, 1):
-            print(f" {idx}. {q}")
-        print(f"[STATUS] INTERACTIVE_QUESTION")
-        sys.exit(10)
+        events = []
+        for i, q in enumerate(questions, 1):
+            ev = parse_structured_question(q, seq=turn_count * 100 + i)
+            ev["verdict"] = evaluate_escalation_threshold(ev)
+            events.append(ev)
+
+        suppress_all = all(ev["verdict"] == "AUTO_SUPPRESS" for ev in events)
+        escalate_any = any(ev["verdict"] == "ESCALATE_PRINCIPAL" for ev in events)
+
+        if suppress_all and not escalate_any:
+            with outbox_file.open("a") as fh:
+                for ev in events:
+                    rec = dict(ev)
+                    rec["suppressed"] = True
+                    fh.write(json.dumps(rec) + "\n")
+            state["suppressed_count"] = int(state.get("suppressed_count", 0)) + len(events)
+            retry_count = int(state.get("_auto_suppress_retry", 0))
+            if retry_count < 1:
+                state["_auto_suppress_retry"] = retry_count + 1
+                state_file.write_text(json.dumps(state, indent=2))
+                print(
+                    f"[THRESHOLD] Suppressed {len(events)} trivial question(s); auto-replying locally.",
+                    file=sys.stderr,
+                )
+                run_turn(
+                    task_id,
+                    "Follow repo conventions and finalize code without conversational sign-off.",
+                    files, cwd, read_files=read_files, restore=True, model=model,
+                    lint_cmd=lint_cmd, test_cmd=test_cmd, dry_run=dry_run,
+                    architect=architect, editor_model=editor_model,
+                    worktree=False, auto_merge=auto_merge, verbose=verbose,
+                    thinking=thinking, reasoning_effort=reasoning_effort,
+                    map_tokens=map_tokens, plan_align=False,
+                    session_root=session_root, tier=tier,
+                )
+                return
+            state_file.write_text(json.dumps(state, indent=2))
+
+        if escalate_any:
+            pending = next(ev for ev in events if ev["verdict"] == "ESCALATE_PRINCIPAL")
+            with outbox_file.open("a") as fh:
+                for ev in events:
+                    rec = dict(ev)
+                    if ev["verdict"] == "AUTO_SUPPRESS":
+                        rec["suppressed"] = True
+                    fh.write(json.dumps(rec) + "\n")
+            state["pending_qid"] = pending["qid"]
+            new_stage = "PLANNING" if (plan_align or pending.get("stage") == "PLANNING") else "IMPLEMENTATION"
+            state["stage"] = new_stage
+            state["status"] = "AWAITING_PLAN_APPROVAL" if new_stage == "PLANNING" else "AWAITING_DECISION"
+            state_file.write_text(json.dumps(state, indent=2))
+            print(f"\n[INTERCEPT] Sub-agent paused with {len(questions)} question(s):")
+            for idx, q in enumerate(questions, 1):
+                print(f" {idx}. {q}")
+            print(f"[STATUS] INTERACTIVE_QUESTION")
+            sys.exit(10)
         
     # Check if diff failed to apply
     if not check_diff_applied_successfully(combined_output):
         rollback_target_files(files, cwd)
+        state["status"] = "FAILED"
+        state_file.write_text(json.dumps(state, indent=2))
         print("[ERROR] Sub-agent search/replace edit failed to apply cleanly to disk!", file=sys.stderr)
         print("[STATUS] DIFF_APPLY_FAILED")
         sys.exit(11)
         
     if proc.returncode != 0:
         rollback_target_files(files, cwd)
+        state["status"] = "FAILED"
+        state_file.write_text(json.dumps(state, indent=2))
         print(f"[ERROR] Aider exited with code {proc.returncode}", file=sys.stderr)
         sys.exit(proc.returncode)
         
+    state["status"] = "COMPLETED"
+    state["pending_qid"] = None
+    state_file.write_text(json.dumps(state, indent=2))
     print("[STATUS] COMPLETED")
     sys.exit(0)
 
 
 def cleanup_session(task_id: str, cwd: Path):
-    session_file = cwd / f".aider.session_{task_id}.md"
-    if session_file.exists():
-        session_file.unlink()
-        print(f"[CLEANUP] Deleted session file: {session_file.name}")
+    session_dir = get_session_dir(task_id, cwd)
+    if session_dir.exists():
+        shutil.rmtree(session_dir, ignore_errors=True)
+        print(f"[CLEANUP] Deleted session dir: {session_dir}")
     else:
-        print(f"[CLEANUP] No session file found to delete for task {task_id}.")
+        print(f"[CLEANUP] No session dir found for task {task_id}.")
+    # Legacy compatibility: prior single-file session artifacts
+    legacy = cwd / f".aider.session_{task_id}.md"
+    if legacy.exists():
+        try:
+            legacy.unlink()
+            print(f"[CLEANUP] Deleted legacy session file: {legacy.name}")
+        except OSError:
+            pass
+
+
+def inspect_session(task_id: str, cwd: Path, as_json: bool = False):
+    """Read session state + latest outbox event; exit 1 if state.json missing."""
+    session_dir = get_session_dir(task_id, cwd)
+    state_file = session_dir / "state.json"
+    if not state_file.exists():
+        print(f"[ERROR] No state.json for task '{task_id}' at {session_dir}", file=sys.stderr)
+        sys.exit(1)
+    try:
+        state = json.loads(state_file.read_text() or "{}")
+    except Exception as e:
+        print(f"[ERROR] Failed to parse state.json: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    latest_outbox = None
+    outbox_file = session_dir / "outbox.jsonl"
+    if outbox_file.exists():
+        lines = [ln for ln in outbox_file.read_text().splitlines() if ln.strip()]
+        if lines:
+            try:
+                latest_outbox = json.loads(lines[-1])
+            except Exception:
+                latest_outbox = None
+
+    if as_json:
+        print(json.dumps(
+            {"task_id": task_id, "state": state, "latest_outbox": latest_outbox},
+            indent=2, ensure_ascii=False,
+        ))
+    else:
+        print(f"[INSPECT] Task: {task_id}")
+        print(f"  Status        : {state.get('status')}")
+        print(f"  Stage         : {state.get('stage')}")
+        print(f"  Pending QID   : {state.get('pending_qid')}")
+        print(f"  Turn Count    : {state.get('turn_count')}")
+        if latest_outbox:
+            print(f"  Latest QID    : {latest_outbox.get('qid')}")
+            print(f"  Latest Question: {latest_outbox.get('question')}")
+    return {"task_id": task_id, "state": state, "latest_outbox": latest_outbox}
+
+
+def reply_session(task_id: str, answer: str, cwd: Path,
+                  source: str = "architect", approved_option: str = None):
+    """Append architect decision to inbox, then resume the session with --restore."""
+    session_dir = get_session_dir(task_id, cwd)
+    state_file = session_dir / "state.json"
+    if not state_file.exists():
+        print(f"[ERROR] No state.json for task '{task_id}' at {session_dir}", file=sys.stderr)
+        sys.exit(1)
+    try:
+        state = json.loads(state_file.read_text() or "{}")
+    except Exception as e:
+        print(f"[ERROR] Failed to parse state.json: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    pending_qid = state.get("pending_qid")
+    inbox_file = session_dir / "inbox.jsonl"
+    inbox_file.touch(exist_ok=True)
+    entry = {
+        "reply_to": pending_qid,
+        "source": source,
+        "approved_option": approved_option,
+        "answer": answer,
+        "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+    with inbox_file.open("a") as fh:
+        fh.write(json.dumps(entry) + "\n")
+
+    prior_stage = (state.get("stage") or "").upper()
+    state["status"] = "RUNNING"
+    state["pending_qid"] = None
+    if prior_stage == "PLANNING":
+        state["stage"] = "IMPLEMENTATION"
+    state_file.write_text(json.dumps(state, indent=2))
+
+    effective_cwd = cwd
+    if state.get("worktree") and state.get("worktree_path"):
+        wp = Path(state["worktree_path"])
+        if wp.exists():
+            effective_cwd = wp
+
+    run_turn(
+        task_id,
+        f"Architect Decision: {answer}. Proceed with implementation.",
+        state.get("files") or [],
+        effective_cwd,
+        read_files=state.get("read_files") or [],
+        restore=True,
+        model=state.get("model") or "deepseek/deepseek-flash",
+        lint_cmd=state.get("lint_cmd"),
+        test_cmd=state.get("test_cmd"),
+        dry_run=False,
+        architect=bool(state.get("architect", False)),
+        editor_model=state.get("editor_model"),
+        worktree=False,
+        auto_merge=bool(state.get("auto_merge", True)),
+        verbose=False,
+        thinking=state.get("thinking") or "auto",
+        reasoning_effort=state.get("reasoning_effort"),
+        map_tokens=int(state.get("map_tokens", 0)),
+        plan_align=False,
+        session_root=cwd,
+        tier=state.get("tier"),
+    )
 
 
 def main():
@@ -1044,6 +1427,8 @@ def main():
     turn_parser.add_argument("--thinking", default="auto", choices=["auto", "on", "off"], help="DeepSeek thinking mode (default: auto)")
     turn_parser.add_argument("--reasoning-effort", default=None, choices=["low", "high", "max"], help="DeepSeek reasoning effort level")
     turn_parser.add_argument("--map-tokens", type=int, default=0, help="Aider repo-map token budget (default: 0)")
+    turn_parser.add_argument("--plan-align", action="store_true",
+                             help="Stage 1 planning: propose architecture, do not edit files")
     turn_parser.add_argument("--cwd", default=".", help="Project working directory")
 
     dispatch_parser = subparsers.add_parser("dispatch", help="Auto-classify and dispatch a task to the optimal tier")
@@ -1059,6 +1444,10 @@ def main():
     dispatch_parser.add_argument("--worktree", action="store_true", help="Run inside an isolated git worktree")
     dispatch_parser.add_argument("--no-auto-merge", action="store_true", help="Do not auto-merge the worktree on completion")
     dispatch_parser.add_argument("-v", "--verbose", action="store_true", help="Include full thinking traces in output")
+    dispatch_parser.add_argument("--plan-align", action="store_true",
+                                 help="Stage 1 planning: propose architecture, do not edit files")
+    dispatch_parser.add_argument("--restore", action="store_true",
+                                 help="Restore prior session history when dispatch resumes a session")
     dispatch_parser.add_argument("--cwd", default=".", help="Project working directory")
     
     clean_parser = subparsers.add_parser("cleanup", help="Clean up session history file")
@@ -1068,6 +1457,19 @@ def main():
     merge_parser = subparsers.add_parser("merge-worktree", help="Merge isolated task worktree branch and clean up worktree")
     merge_parser.add_argument("--task-id", required=True, help="Task identifier whose worktree should be merged")
     merge_parser.add_argument("--cwd", default=".", help="Project working directory")
+
+    inspect_parser = subparsers.add_parser("inspect", help="Show session state + latest outbox question")
+    inspect_parser.add_argument("--task-id", required=True)
+    inspect_parser.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
+    inspect_parser.add_argument("--cwd", default=".", help="Project working directory")
+
+    reply_parser = subparsers.add_parser("reply", help="Answer a pending question and resume the session")
+    reply_parser.add_argument("--task-id", required=True)
+    reply_parser.add_argument("--answer", required=True, help="Architect decision text")
+    reply_parser.add_argument("--source", default="architect",
+                              choices=["architect", "user", "auto"])
+    reply_parser.add_argument("--approved-option", default=None, help="Chosen option key (A/B/…)")
+    reply_parser.add_argument("--cwd", default=".", help="Project working directory")
 
     log_parser = subparsers.add_parser("compact-log", help="Strip ANSI codes and print the tail of a log")
     log_parser.add_argument("--log-file", required=True, help="Path to the log file to compact")
@@ -1093,16 +1495,22 @@ def main():
                  editor_model=args.editor_model, worktree=args.worktree,
                  auto_merge=not args.no_auto_merge, verbose=args.verbose,
                  thinking=args.thinking, reasoning_effort=args.reasoning_effort,
-                 map_tokens=args.map_tokens)
+                 map_tokens=args.map_tokens, plan_align=args.plan_align)
     elif args.command == "dispatch":
         run_dispatch(args.task_id, args.message, args.files, cwd_path,
                      read_files=args.read_files, test_cmd=args.test_cmd,
                      tier=args.tier, thinking=args.thinking,
                      reasoning_effort=args.reasoning_effort,
                      dry_run=args.dry_run, worktree=args.worktree,
-                     auto_merge=not args.no_auto_merge, verbose=args.verbose)
+                     auto_merge=not args.no_auto_merge, verbose=args.verbose,
+                     plan_align=args.plan_align, restore=args.restore)
     elif args.command == "cleanup":
         cleanup_session(args.task_id, cwd_path)
+    elif args.command == "inspect":
+        inspect_session(args.task_id, cwd_path, as_json=args.json)
+    elif args.command == "reply":
+        reply_session(args.task_id, args.answer, cwd_path,
+                      source=args.source, approved_option=args.approved_option)
     elif args.command == "merge-worktree":
         merge_worktree_task(args.task_id, cwd_path)
     elif args.command == "compact-log":

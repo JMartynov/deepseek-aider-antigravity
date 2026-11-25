@@ -116,6 +116,7 @@ Before delegating any implementation or refactoring task to DeepSeek, the lead o
 - **`--test-cmd <cmd>`**: Enables `--auto-test --test-cmd <cmd>` so the sub-agent verifies and repairs failing tests before returning (exit `0` only when tests pass).
 - **`--dry-run`**: Runs Aider in dry-run mode — diffs are proposed but not written to disk, ideal for low-cost plan/spec review.
 - **`--architect` / `--editor-model`**: Enables a two-model architect workflow (`--architect`). When using `--model deepseek/deepseek-reasoner --architect` and no `--editor-model` is supplied, the editor model defaults to the cheaper/faster `deepseek/deepseek-flash`; pass `--editor-model <name>` to override. `--editor-model` is also honoured without `--architect`.
+- **`--plan-align`**: Stage 1 planning turn — propose architecture, do NOT edit files, escalate via structured `QUESTION:`; sets `AWAITING_PLAN_APPROVAL`.
 
 **Mandatory Delegation Rules for Orchestrator Sub-Agents:**
 1. **NEVER write tests manually in a separate orchestrator turn.** Always pass `--test-cmd "<cmd>"` so Aider runs `--auto-test` itself and self-heals failing assertions inside the same turn (closed-loop TDD). This preserves prefix cache and minimizes token cost.
@@ -151,6 +152,64 @@ python3 ~/.gemini/config/skills/aider-deepseek/scripts/aider_bridge.py turn \
   --read-files interfaces/user.py \
   --cwd "/path/to/project"
 ```
+
+### Step 2a: Inspect Session State & Reply (Bidirectional Protocol)
+
+```bash
+# Dump session state + latest outbox question
+python3 ~/.gemini/config/skills/aider-deepseek/scripts/aider_bridge.py inspect \
+  --task-id "auth_service_01" --cwd "/path/to/project"
+
+python3 ~/.gemini/config/skills/aider-deepseek/scripts/aider_bridge.py inspect \
+  --task-id "auth_service_01" --json --cwd "/path/to/project"
+
+# Resolve pending question and resume (system_rules NOT re-prepended → 95%+ cache hit)
+python3 ~/.gemini/config/skills/aider-deepseek/scripts/aider_bridge.py reply \
+  --task-id "auth_service_01" \
+  --answer "Use Redis JTI revocation set, inject RedisClient Protocol" \
+  --approved-option B \
+  --cwd "/path/to/project"
+```
+
+Structured session artifacts live under `.aider-sessions/<task_id>/` (git-ignored):
+
+```
+.aider-sessions/<task_id>/
+├── state.json         # RUNNING | AWAITING_PLAN_APPROVAL | AWAITING_DECISION | COMPLETED | FAILED
+├── chat_history.md    # Aider --chat-history-file
+├── outbox.jsonl       # Structured questions emitted by DeepSeek
+└── inbox.jsonl        # Architect decisions written by `reply`
+```
+
+### Structured QUESTION Contract
+
+```text
+QUESTION: [STAGE: PLANNING|IMPLEMENTATION] [CATEGORY: ARCHITECTURE|SCHEMA|...] [IMPACT: HIGH]
+<concise technical inquiry explaining what decision is needed>
+[OPTIONS:
+  A) <Option A>
+  B) <Option B>
+]
+[RECOMMENDATION: Option A (Reason)]
+```
+
+### Anti-Noise Threshold Gate
+
+- **`AUTO_SUPPRESS`**: boilerplate sign-offs (`Should I proceed?`, `Would you like me to…`) or `IMPACT: LOW`. Auto-replied locally at most once — **0 principal tokens**.
+- **`ESCALATE_PRINCIPAL`**: `[STAGE: PLANNING]`, `ARCHITECTURE`, `SCHEMA`, `API_CONTRACT`, `CONCURRENCY`, `TRADEOFF`, `BREAKING_CHANGE`, `SECURITY`, `UNRESOLVABLE_FAILURE`, `AMBIGUITY`, `IMPACT: HIGH`, or substantive unstructured questions. Writes to `outbox.jsonl`, sets `state.json` to `AWAITING_*`, exits `10`.
+
+### Stage 1 Planning Alignment (`--plan-align`)
+
+```bash
+python3 .../aider_bridge.py turn \
+  --task-id "auth_service_01" \
+  --message "Plan the auth refactor" \
+  --files auth.py \
+  --plan-align \
+  --cwd "/path/to/project"
+```
+
+Injects Stage 1 planning rules; DeepSeek MUST NOT edit files — it analyzes scope, surfaces trade-offs and emits a structured `QUESTION: [STAGE: PLANNING] ...`. Session state moves to `AWAITING_PLAN_APPROVAL` until `reply` resolves it.
 
 ### Step 3: Verifying & Cleaning Up
 After test verification succeeds:
@@ -230,7 +289,7 @@ python3 ~/.gemini/config/skills/aider-deepseek/scripts/aider_bridge.py dispatch 
 | 3 | `ARCHITECT` | >3 files or complex/AST/concurrency keywords (architect, refactor, ast, visitor, sqlglot, security guard, concurrency, mutex, lock, cross-module, cross-repo, redesign, rewrite, migrate) | `deepseek-reasoner` + `flash` editor / `on` (high) | active |
 | 4 | `RESEARCH` | No editable files with research intent (research, search, lookup, pep, cve, advisory, spec, what is, how does, documentation) or no `--test-cmd` | DeepSeek `search` API | n/a |
 
-Flags: `--tier {auto,patch,surgical,architect,research}`, `--thinking {auto,on,off}`, `--reasoning-effort {low,high,max}`, `--dry-run`, `--worktree`, `--no-auto-merge`, `-v/--verbose`.
+Flags: `--tier {auto,patch,surgical,architect,research}`, `--thinking {auto,on,off}`, `--reasoning-effort {low,high,max}`, `--dry-run`, `--worktree`, `--no-auto-merge`, `-v/--verbose`, `--restore` (resumes prior session on dispatch).
 
 ---
 
@@ -246,6 +305,7 @@ Flags: `--tier {auto,patch,surgical,architect,research}`, `--thinking {auto,on,o
 | `13` | `AIDER_INVOCATION_FAILED` | Process error during launch. Target files automatically rolled back. |
 | `14` | `PREFLIGHT_FAILED` | Missing read-only reference file before starting Aider turn. |
 | `15` | `MERGE_FAILED` | Worktree branch failed to cleanly merge into base branch. |
+| `5`  | `MERGE_BLOCKED` | `merge-worktree` aborted because `state.json` status is `AWAITING_*`. Resolve via `reply` first. |
 | `2`  | `INVALID_ARGUMENT`        | Query empty/overlong (1-128 chars) or `--count` out of range (1-50). |
 | `16` | `SEARCH_RATE_LIMITED`     | DeepSeek search API returned HTTP 429. Retry after backoff. |
 | `17` | `SEARCH_API_ERROR`        | Non-429 HTTP error from DeepSeek search API. |

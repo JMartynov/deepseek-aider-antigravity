@@ -20,6 +20,7 @@ Designed for intense daily programming workflows (up to 5 hours/day) while stric
 - **Read-Only Scope Protection**: Supports `--read-files` to open reference schemas and interfaces with `--read`, preventing accidental edits to read-only code.
 - **Closed-Loop TDD Delegation**: `--test-cmd <cmd>` wires `--auto-test --test-cmd` so failing tests are fed back to DeepSeek for self-healing within the same turn (best combined with `--worktree`/`--no-auto-merge`).
 - **Dry-Run & Architect Modes**: `--dry-run` proposes diffs without writing; `--architect` enables two-model editing where `--editor-model` defaults to `deepseek/deepseek-flash` when `--model` is `deepseek/deepseek-reasoner`.
+- **Bidirectional Async Messaging & Plan Alignment**: Structured `.aider-sessions/<task_id>/` state (state.json + outbox.jsonl + inbox.jsonl), Stage-1 `--plan-align` consults, `inspect` / `reply` CLI commands, anti-noise threshold gate (boilerplate sign-offs auto-suppressed), and a strict merge guard that blocks `merge-worktree` while any decision is pending (`AWAITING_*` → exit 5).
 
 ---
 
@@ -137,6 +138,61 @@ python3 scripts/aider_bridge.py cleanup \
   --cwd "<project_dir>"
 ```
 
+### 3a. Inspect Session & Reply (Bidirectional Protocol)
+
+```bash
+# Dump current state + latest pending question
+python3 scripts/aider_bridge.py inspect --task-id "<task_id>" --cwd "<project_dir>"
+python3 scripts/aider_bridge.py inspect --task-id "<task_id>" --json --cwd "<project_dir>"
+
+# Answer and resume (prefix cache preserved; system_rules NOT re-prepended on Turn 2+)
+python3 scripts/aider_bridge.py reply \
+  --task-id "<task_id>" \
+  --answer "Use Redis JTI revocation set, inject RedisClient Protocol" \
+  --approved-option B \
+  --cwd "<project_dir>"
+```
+
+Session artifacts (git-ignored):
+
+```
+.aider-sessions/<task_id>/
+├── state.json         # RUNNING | AWAITING_PLAN_APPROVAL | AWAITING_DECISION | COMPLETED | FAILED
+├── chat_history.md
+├── outbox.jsonl       # Structured questions DeepSeek → Principal
+└── inbox.jsonl        # Principal → DeepSeek decisions
+```
+
+### 3b. Stage 1 Plan Alignment (`--plan-align`)
+
+```bash
+python3 scripts/aider_bridge.py turn \
+  --task-id "<task_id>" --message "Plan the refactor" --files feature.py \
+  --plan-align \
+  --cwd "<project_dir>"
+```
+
+Forbids file edits — DeepSeek analyzes scope and emits a structured `QUESTION: [STAGE: PLANNING] …`. Session state becomes `AWAITING_PLAN_APPROVAL`; use `reply` to resolve, then `merge-worktree`.
+
+### Structured `QUESTION:` Contract
+
+```text
+QUESTION: [STAGE: PLANNING|IMPLEMENTATION] [CATEGORY: ARCHITECTURE|SCHEMA|...] [IMPACT: HIGH]
+<concise technical inquiry>
+[OPTIONS:
+  A) ...
+  B) ...
+]
+[RECOMMENDATION: Option A]
+```
+
+### Anti-Noise Threshold Gate
+
+| Verdict | Trigger | Action |
+| :--- | :--- | :--- |
+| `AUTO_SUPPRESS` | `Should I proceed?`, `Would you like me to…`, `IMPACT: LOW` | Auto-reply locally once; 0 principal tokens |
+| `ESCALATE_PRINCIPAL` | `[STAGE: PLANNING]`, `ARCHITECTURE`, `SCHEMA`, `BREAKING_CHANGE`, `SECURITY`, `AMBIGUITY`, `UNRESOLVABLE_FAILURE`, `IMPACT: HIGH`, or substantive unstructured | Write to `outbox.jsonl`, exit `10` |
+
 ### 4. Advanced Turn Options
 ```bash
 # Closed-loop TDD inside an isolated worktree
@@ -158,7 +214,14 @@ python3 scripts/aider_bridge.py turn \
   --task-id "<task_id>" --message "Design and implement." --files feature.py \
   --model deepseek/deepseek-reasoner --architect \
   --cwd "<project_dir>"
+
+# Stage 1 planning (no edits, escalate structural choice)
+python3 scripts/aider_bridge.py turn \
+  --task-id "<task_id>" --message "Plan auth module" --files auth.py --plan-align \
+  --cwd "<project_dir>"
 ```
+
+- **Exit `5` (`MERGE_BLOCKED`)** — `merge-worktree` was blocked because `state.json` status is `AWAITING_*`; call `reply` first.
 
 ### Web Search Delegation
 
@@ -194,7 +257,7 @@ python3 scripts/aider_bridge.py dispatch \
 | 3 | `ARCHITECT` | >3 files or complex/AST/concurrency keywords | `deepseek-reasoner` + `flash` editor / `on` (high) | active |
 | 4 | `RESEARCH` | No editable files with research intent, or no `--test-cmd` | DeepSeek `search` API | n/a |
 
-Flags: `--tier {auto,patch,surgical,architect,research}`, `--thinking {auto,on,off}`, `--reasoning-effort {low,high,max}`, `--dry-run`, `--worktree`, `--no-auto-merge`, `-v/--verbose`.
+Flags: `--tier {auto,patch,surgical,architect,research}`, `--thinking {auto,on,off}`, `--reasoning-effort {low,high,max}`, `--dry-run`, `--worktree`, `--no-auto-merge`, `-v/--verbose`, `--plan-align`, `--restore` (resumes a session on dispatch).
 
 ---
 
