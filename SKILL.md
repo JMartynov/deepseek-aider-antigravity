@@ -289,7 +289,31 @@ python3 ~/.gemini/config/skills/aider-deepseek/scripts/aider_bridge.py dispatch 
 | 3 | `ARCHITECT` | >3 files or complex/AST/concurrency keywords (architect, refactor, ast, visitor, sqlglot, security guard, concurrency, mutex, lock, cross-module, cross-repo, redesign, rewrite, migrate) | `deepseek-reasoner` + `flash` editor / `on` (high) | active |
 | 4 | `RESEARCH` | No editable files with research intent (research, search, lookup, pep, cve, advisory, spec, what is, how does, documentation) or no `--test-cmd` | DeepSeek `search` API | n/a |
 
-Flags: `--tier {auto,patch,surgical,architect,research}`, `--model`, `--editor-model`, `--architect`, `--thinking {auto,on,off}`, `--reasoning-effort {low,high,max}`, `--map-tokens`, `--lint-cmd`, `--test-cmd`, `--dry-run`, `--worktree`, `--no-auto-merge`, `-v/--verbose`, `--plan-align`, `--restore` (resumes prior session on dispatch), `--count`, `--need-content`, `--json` (Tier 4 research).
+Flags: `--tier {auto,patch,surgical,architect,research}`, `--model`, `--editor-model`, `--architect`, `--thinking {auto,on,off}`, `--reasoning-effort {low,high,max}`, `--map-tokens`, `--lint-cmd`, `--test-cmd`, `--dry-run`, `--worktree`, `--no-auto-merge`, `-v/--verbose`, `--plan-align`, `--restore` (resumes prior session on dispatch), `--auto-scope` (auto-run `scope` when `--files` is omitted), `--count`, `--need-content`, `--json` (Tier 4 research).
+
+### Step 6b: 2-Route Smart Pre-Task Repo Inspection Gateway
+
+When target files for a task are not yet known, the gateway avoids exploratory `grep`/`find` token burn using two complementary routes:
+
+- **Route 1 — DeepSeek `scope` / `dispatch --auto-scope`** (single-repo code tasks):
+  - Invokes Aider in `--chat-mode context` (`--map-tokens 1536 --map-multiplier-no-files 1`, `thinking: off`) with ephemeral data-dir shields (`.worktrees/`, `artifacts/`, `passports/`, `advisories/`, and `*.json` data dumps).
+  - Parses `editable_files` (strictly validated repo-relative paths), `relevant_symbols`, auto-discovered `read_files` (`tests/test_<stem>.py`, `tests/unit/test_<stem>.py`, plus bounded symbol-referencing files), `suggested_test_cmd` (`uv run pytest <test_files> -q`), `suggested_tier`, `confidence` (`high` vs `low`), and token/cost metrics.
+- **Route 2 — Antigravity `flash` Researcher Fallback** (cross-repo, git-history, or runtime investigations — or when Route 1 returns `confidence: "low"` / empty `editable_files`):
+  - `dispatch --auto-scope` prints `[DISPATCHER] Auto-scope returned low confidence (no editable files); escalate to Antigravity research subagent.` and exits `14` (`PREFLIGHT_FAILED`), handing control to the orchestrator's `research` (`flash`) subagent.
+
+```bash
+# Route 1: Standalone repo inspection (JSON output for orchestrator routing)
+python3 ~/.gemini/config/skills/aider-deepseek/scripts/aider_bridge.py scope \
+  --message "Add rate limiting to token verification" \
+  --cwd "/path/to/project" \
+  --map-tokens 1536 --json \
+  --model deepseek/deepseek-flash --thinking off
+
+# Route 1: Automated scope -> classify -> dispatch in isolated worktree
+python3 ~/.gemini/config/skills/aider-deepseek/scripts/aider_bridge.py dispatch \
+  --task-id "auth_02" --message "Add rate limiting to token verification" \
+  --auto-scope --worktree --cwd "/path/to/project"
+```
 
 ### Complete DeepSeek Options & Smart Dispatcher Reference Matrix
 
@@ -310,6 +334,7 @@ Flags: `--tier {auto,patch,surgical,architect,research}`, `--model`, `--editor-m
 | **Context** | `--map-tokens <N>` | `turn`, `dispatch` | Sets Aider `--map-tokens` repo-map budget (Tier 1/4: `0`, Tier 2/3: `512`). | Keep `0` for isolated single-file edits; `512`+ when cross-file symbol awareness is needed. |
 | **Caching** | `caches_by_default`, `examples_as_sys_msg` | Ephemeral YAML | Automatically written to `.aider.model.settings.<pid>.yml` for all DeepSeek models with `edit_format: diff` (`editor-diff` for editor). | Always active automatically for DeepSeek models to maximize server-side prefix cache hits. |
 | **Search** | `--count`, `--need-content`, `--json` | `search`, `dispatch` (Tier 4) | Configures DeepSeek search results (`1–50`, full page body, raw JSON output). | Research external APIs, PEPs, CVEs, or docs before coding (Tier 4 routes here automatically). |
+| **Scope** | `scope`, `--auto-scope`, `--map-tokens 1536` | `scope`, `dispatch` | Route 1 repo inspection via Aider `--chat-mode context` with data-dir shields (`.worktrees/`, `artifacts/`, `passports/`, `advisories/`, `*.json`); extracts `editable_files`, `relevant_symbols`, auto-discovered `read_files`, `suggested_test_cmd`, `suggested_tier`, `confidence` (`high`/`low`), and cost metrics. | Discover target/test scope before dispatch; `--auto-scope` escalates to Route 2 (exit `14`) on low confidence. |
 | **Async / Guard** | `inspect`, `reply`, `merge-worktree`, `cleanup`, `compact-log` | Standalone subcommands | Inspects `state.json`/`outbox.jsonl` (`--json`), answers pending questions (`--answer`, `--source`, `--approved-option`), guards merges (`AWAITING_*` → exit `5`), cleans sessions, compacts logs. | Use after exit `10`, before merging worktrees, after completion, or when triaging long error logs. |
 | **Telemetry** | `-v` / `--verbose`, `filter_turn_output`, `strip_thinking_block` | `turn`, `dispatch` | Strips startup banners and `► **THINKING** ... ► **ANSWER**` blocks by default; `-v` retains raw traces. | Leave off by default for token sparsity; enable `-v` only when debugging raw reasoning traces. |
 
@@ -325,7 +350,7 @@ Flags: `--tier {auto,patch,surgical,architect,research}`, `--model`, `--editor-m
 | `11` | `DIFF_APPLY_FAILED` | Aider search block did not match. Target files automatically rolled back. |
 | `12` | `PATH_TRAVERSAL_VIOLATION` | Target file path resolves outside project root. |
 | `13` | `AIDER_INVOCATION_FAILED` | Process error during launch. Target files automatically rolled back. |
-| `14` | `PREFLIGHT_FAILED` | Missing read-only reference file before starting Aider turn. |
+| `14` | `PREFLIGHT_FAILED` | Missing read-only reference file before starting Aider turn, or `dispatch --auto-scope` returned low confidence (no `editable_files`; escalate to Route 2 Antigravity `flash` researcher). |
 | `15` | `MERGE_FAILED` | Worktree branch failed to cleanly merge into base branch. |
 | `5`  | `MERGE_BLOCKED` | `merge-worktree` aborted because `state.json` status is `AWAITING_*`. Resolve via `reply` first. |
 | `2`  | `INVALID_ARGUMENT`        | Query empty/overlong (1-128 chars) or `--count` out of range (1-50). |

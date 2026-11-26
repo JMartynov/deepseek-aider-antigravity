@@ -427,7 +427,8 @@ def run_dispatch(task_id: str, message: str, files: list[str], cwd: Path,
                  worktree: bool = False, auto_merge: bool = True,
                  verbose: bool = False, plan_align: bool = False,
                  restore: bool = False, count: int = 5,
-                 need_content: bool = False, as_json: bool = False):
+                 need_content: bool = False, as_json: bool = False,
+                 auto_scope: bool = False):
     """
     Classify a task into its optimal precision tier and dispatch it to the
     matching model/thinking/edit-format configuration (or DeepSeek search).
@@ -437,6 +438,23 @@ def run_dispatch(task_id: str, message: str, files: list[str], cwd: Path,
     except ValueError as e:
         print(f"[ERROR] Security violation: {e}", file=sys.stderr)
         sys.exit(12)
+
+    if auto_scope and not files:
+        scope_result = run_scope(message=message, cwd=cwd)
+        if (scope_result or {}).get("confidence") == "low" or not (scope_result or {}).get("editable_files"):
+            print(
+                "[DISPATCHER] Auto-scope returned low confidence (no editable files); "
+                "escalate to Antigravity research subagent."
+            )
+            sys.exit(14)
+        files = list(scope_result["editable_files"])
+        merged_read = list(read_files or [])
+        for rf in (scope_result.get("read_files") or []):
+            if rf not in files and rf not in merged_read:
+                merged_read.append(rf)
+        read_files = merged_read
+        if not test_cmd and scope_result.get("suggested_test_cmd"):
+            test_cmd = scope_result["suggested_test_cmd"]
 
     tier_name, reasoning, resolved = classify_task(
         message, files=files, read_files=read_files,
@@ -956,7 +974,7 @@ def check_diff_applied_successfully(output: str):
     return True
 
 
-def create_ephemeral_aiderignore(cwd: Path):
+def create_ephemeral_aiderignore(cwd: Path, scope_mode: bool = False):
     """Create an ephemeral .aiderignore shield covering secrets and cache artifacts."""
     ignore_path = cwd / ".aiderignore.ephemeral"
     patterns = [
@@ -976,7 +994,13 @@ def create_ephemeral_aiderignore(cwd: Path):
         ".cache/",
         "node_modules/",
         ".aider-sessions/",
+        ".worktrees/",
+        "artifacts/",
+        "passports/",
+        "advisories/",
     ]
+    if scope_mode:
+        patterns.append("*.json")
     ignore_path.write_text("\n".join(patterns) + "\n")
     return ignore_path
 
@@ -997,7 +1021,7 @@ def remove_ephemeral_aiderignore(ignore_path: Path):
 
 def create_ephemeral_model_settings(cwd: Path, model: str, editor_model: str = None,
                                     architect: bool = False, thinking: str = "auto",
-                                    reasoning_effort: str = None):
+                                    reasoning_effort: str = None, edit_format: str = "diff"):
     """
     Ensure deepseek models (e.g. deepseek/deepseek-flash) have explicit
     caches_by_default=True and edit_format=diff configured in Aider settings.
@@ -1016,7 +1040,8 @@ def create_ephemeral_model_settings(cwd: Path, model: str, editor_model: str = N
     lines = []
     if model_is_deepseek:
         lines.append(f"- name: {model}")
-        lines.append("  edit_format: diff")
+        if edit_format is not None:
+            lines.append(f"  edit_format: {edit_format}")
         lines.append("  caches_by_default: true")
         lines.append("  examples_as_sys_msg: true")
         extra = []
@@ -1042,6 +1067,344 @@ def create_ephemeral_model_settings(cwd: Path, model: str, editor_model: str = N
     settings_path = cwd / f".aider.model.settings.{os.getpid()}.yml"
     settings_path.write_text("\n".join(lines) + "\n")
     return settings_path
+
+
+_CONTEXT_ALL_FILES_RE = re.compile(r"^\s*#*\s*ALL\s+files?\b", re.IGNORECASE)
+_CONTEXT_OTHER_FILES_RE = re.compile(
+    r"^\s*#*\s*Relevant\s+symbols\s+from\s+OTHER\s+files\b", re.IGNORECASE
+)
+_PATH_TOKEN_RE = re.compile(r"(?:\./)?[A-Za-z0-9_\-./]+\.[A-Za-z0-9]+")
+_BACKTICK_RE = re.compile(r"`([^`]+)`")
+_BULLET_RE = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+(.*)$")
+_IDENT_TOKEN_RE = re.compile(
+    r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*(?:\s*\([^)]*\))?"
+)
+_BACKTICK_SYMBOL_RE = re.compile(
+    r"^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*$"
+)
+_SYMBOL_FILE_EXTS = (
+    ".py", ".md", ".json", ".toml", ".yaml", ".yml", ".txt", ".rst", ".ini",
+    ".cfg", ".js", ".ts", ".tsx", ".jsx", ".go", ".rs", ".java", ".c", ".cpp",
+    ".h", ".sh", ".sql",
+)
+_CONTEXT_STOPWORDS = frozenset({
+    "a", "an", "and", "or", "the", "is", "are", "was", "were", "be", "to",
+    "of", "in", "on", "for", "with", "by", "as", "at", "from", "that", "this",
+    "these", "those", "it", "its", "if", "then", "else", "not", "no", "yes",
+    "method", "methods", "class", "classes", "function", "functions", "def",
+    "return", "import", "file", "files", "symbol", "symbols", "relevant",
+    "other", "all", "use", "used", "uses", "using", "call", "called", "calls",
+    "see", "also", "may", "can", "will", "should", "would", "could", "do",
+    "does", "did", "has", "have", "had", "here", "there", "where", "when",
+    "which", "who", "what", "how", "why", "example", "examples", "note",
+    "notes", "test", "tests", "add", "adds", "update", "updates", "run",
+    "runs", "new", "old", "some", "any", "one", "two",
+})
+
+_DISCOVERY_SKIP_DIRS = frozenset({
+    ".git", ".venv", "venv", ".worktrees", "node_modules", "__pycache__",
+    ".pytest_cache", ".cache", ".aider-sessions", "artifacts", "passports",
+    "advisories", "dist", "build",
+})
+_DISCOVERY_SCAN_EXTS = (
+    ".py", ".pyi", ".ts", ".tsx", ".js", ".jsx", ".go", ".rs", ".java",
+    ".c", ".cpp", ".h", ".md", ".toml", ".yaml", ".yml",
+)
+_MAX_SCAN_BYTES = 256 * 1024
+
+
+def _clean_candidate_path(raw: str) -> str:
+    """Normalize a candidate path token: strip quotes/backticks, leading './', trailing punctuation."""
+    cand = (raw or "").strip().strip("`'\"")
+    cand = cand.strip()
+    while cand.startswith("./"):
+        cand = cand[2:]
+    cand = cand.rstrip(":,.;) ").strip()
+    return cand
+
+
+def parse_context_output(output: str, cwd: Path) -> dict:
+    """Parse Aider --chat-mode context output into editable files and relevant symbols."""
+    clean = ANSI_ESCAPE_RE.sub("", strip_thinking_block(output or ""))
+    cwd_resolved = cwd.resolve()
+    editable_files = []
+    seen_files = set()
+    relevant_symbols = []
+    seen_symbols = set()
+
+    def _add_file(candidate: str):
+        cand = _clean_candidate_path(candidate)
+        if not cand:
+            return
+        if os.path.isabs(cand) or ".." in Path(cand).parts:
+            return
+        resolved = (cwd / cand).resolve()
+        if resolved == cwd_resolved:
+            return
+        try:
+            if not resolved.is_relative_to(cwd_resolved):
+                return
+        except (ValueError, AttributeError):
+            return
+        if not resolved.is_file():
+            return
+        rel = resolved.relative_to(cwd_resolved).as_posix()
+        if rel in seen_files:
+            return
+        seen_files.add(rel)
+        editable_files.append(rel)
+
+    def _add_symbol(name: str):
+        sym = (name or "").strip()
+        if not sym or sym in seen_symbols:
+            return
+        seen_symbols.add(sym)
+        relevant_symbols.append(sym)
+
+    in_other = False
+    for line in clean.splitlines():
+        if _CONTEXT_OTHER_FILES_RE.match(line):
+            in_other = True
+            continue
+        if _CONTEXT_ALL_FILES_RE.match(line):
+            in_other = False
+            continue
+
+        for bt in _BACKTICK_RE.findall(line):
+            candidate = bt.strip()
+            if not candidate:
+                continue
+            if "/" in candidate or candidate.lower().endswith(_SYMBOL_FILE_EXTS):
+                if not in_other:
+                    _add_file(candidate)
+                continue
+            sym = candidate
+            for suffix in ("(...)", "()"):
+                if sym.endswith(suffix):
+                    sym = sym[:-len(suffix)]
+                    break
+            sym = sym.strip()
+            if _BACKTICK_SYMBOL_RE.match(sym):
+                _add_symbol(sym)
+
+        if not in_other:
+            for tok in _PATH_TOKEN_RE.findall(line):
+                _add_file(tok)
+
+        if "`" in line:
+            continue
+        bullet = _BULLET_RE.match(line)
+        if not bullet:
+            continue
+        body = bullet.group(1)
+        for m in _IDENT_TOKEN_RE.finditer(body):
+            tok = m.group(0)
+            start, end = m.span()
+            if (end < len(body) and body[end] == "/") or (start > 0 and body[start - 1] == "/"):
+                continue
+            has_parens = "(" in tok
+            name = tok.split("(")[0].strip()
+            if not name:
+                continue
+            if "/" in name or name.lower().endswith(_SYMBOL_FILE_EXTS):
+                continue
+            if not has_parens and "." not in name:
+                low = name.lower()
+                if low in _CONTEXT_STOPWORDS or len(name) < 3:
+                    continue
+            _add_symbol(name)
+
+    return {"editable_files": editable_files, "relevant_symbols": relevant_symbols}
+
+
+def discover_read_files(editable_files: list[str], relevant_symbols: list[str], cwd: Path,
+                        max_scan_files: int = 500, max_symbol_files: int = 10) -> tuple[list[str], list[str]]:
+    """Resolve read-only references (matching tests + symbol-bearing files) for a scope."""
+    editable_list = list(editable_files or [])
+    editable_set = set(editable_list)
+    cwd_resolved = cwd.resolve()
+    read_files = []
+    read_seen = set()
+    matching_test_files = []
+    test_seen = set()
+
+    def _add_read(p: str):
+        if p in editable_set or p in read_seen:
+            return
+        read_seen.add(p)
+        read_files.append(p)
+
+    def _add_test(p: str):
+        if p in test_seen:
+            return
+        test_seen.add(p)
+        matching_test_files.append(p)
+
+    for ef in editable_list:
+        name = Path(ef).name
+        if (name.startswith("test_") or name.endswith("_test.py")) and (cwd / ef).is_file():
+            _add_test(ef)
+        stem = Path(ef).stem
+        for cand in (f"tests/test_{stem}.py", f"tests/unit/test_{stem}.py"):
+            if (cwd / cand).is_file():
+                _add_test(cand)
+                _add_read(cand)
+
+    sym_patterns = []
+    for sym in (relevant_symbols or []):
+        if not sym:
+            continue
+        base = sym.split(".")[0]
+        token = base if len(base) >= 3 else sym
+        if not token:
+            continue
+        try:
+            sym_patterns.append(re.compile(rf"\b{re.escape(token)}\b"))
+        except re.error:
+            continue
+
+    if sym_patterns:
+        scanned = 0
+        added = 0
+        done = False
+        for root, dirnames, filenames in os.walk(str(cwd_resolved)):
+            dirnames[:] = [d for d in dirnames if d not in _DISCOVERY_SKIP_DIRS]
+            for fname in filenames:
+                if scanned >= max_scan_files or added >= max_symbol_files:
+                    done = True
+                    break
+                if not fname.endswith(_DISCOVERY_SCAN_EXTS):
+                    continue
+                fpath = Path(root) / fname
+                try:
+                    if fpath.stat().st_size > _MAX_SCAN_BYTES:
+                        continue
+                    content = fpath.read_text(encoding="utf-8", errors="ignore")
+                except OSError:
+                    continue
+                scanned += 1
+                if not any(p.search(content) for p in sym_patterns):
+                    continue
+                try:
+                    rel = fpath.resolve().relative_to(cwd_resolved).as_posix()
+                except (ValueError, OSError):
+                    continue
+                if rel in editable_set or rel in read_seen:
+                    continue
+                read_seen.add(rel)
+                read_files.append(rel)
+                added += 1
+            if done:
+                break
+
+    return read_files, matching_test_files
+
+
+def run_scope(message: str, cwd: Path, map_tokens: int = 1536, as_json: bool = False,
+              model: str = "deepseek/deepseek-flash", thinking: str = "off",
+              verbose: bool = False) -> dict:
+    """Run the Smart Pre-Task Repo Inspection Gateway via Aider --chat-mode context."""
+    load_project_env(cwd)
+    if not os.environ.get("DEEPSEEK_API_KEY"):
+        print("[ERROR] DEEPSEEK_API_KEY not found in project .env file!", file=sys.stderr)
+        sys.exit(1)
+
+    ignore_path = create_ephemeral_aiderignore(cwd, scope_mode=True)
+    model_settings_path = create_ephemeral_model_settings(
+        cwd, model, thinking=thinking, edit_format=None
+    )
+
+    cmd = [
+        "uvx", "--from", "aider-chat", "aider",
+        "--model", model,
+        "--chat-mode", "context",
+        "--map-tokens", str(map_tokens),
+        "--map-multiplier-no-files", "1",
+        "--no-auto-commits",
+        "--yes-always",
+        "--no-detect-urls",
+        "--no-analytics",
+        "--no-check-update",
+        "--no-show-release-notes",
+        "--no-gitignore",
+        "--aiderignore", str(ignore_path),
+        "--message", message,
+    ]
+    if model_settings_path:
+        cmd.extend(["--model-settings-file", str(model_settings_path)])
+    elif thinking == "off":
+        cmd.extend(["--thinking-tokens", "0"])
+    if not (cwd / ".git").exists():
+        cmd.append("--no-git")
+
+    try:
+        proc = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
+    except Exception as e:
+        print(
+            f"[ERROR] Aider scope invocation failed: {_sanitize_secret(str(e))}",
+            file=sys.stderr,
+        )
+        print("[STATUS] AIDER_INVOCATION_FAILED", file=sys.stderr)
+        sys.exit(13)
+    finally:
+        remove_ephemeral_aiderignore(ignore_path)
+        remove_ephemeral_file(model_settings_path)
+
+    combined = (proc.stdout or "") + "\n" + (proc.stderr or "")
+    if verbose:
+        print(filter_turn_output(combined, verbose=True))
+    if proc.returncode != 0:
+        print(
+            f"[ERROR] Aider scope command exited with code {proc.returncode}",
+            file=sys.stderr,
+        )
+        sys.exit(proc.returncode)
+
+    parsed = parse_context_output(combined, cwd)
+    editable_files = parsed.get("editable_files") or []
+    relevant_symbols = parsed.get("relevant_symbols") or []
+    read_files, matching_test_files = discover_read_files(
+        editable_files, relevant_symbols, cwd
+    )
+    tokens_sent, cache_write, cache_hit, tokens_rcvd, cost_msg, cost_session = \
+        parse_cost_and_tokens(combined)
+    suggested_test_cmd = (
+        f"uv run pytest {' '.join(matching_test_files)} -q"
+        if matching_test_files else None
+    )
+    suggested_tier = classify_task(
+        message, files=editable_files, read_files=read_files, test_cmd=suggested_test_cmd
+    )[0]
+    confidence = "high" if editable_files else "low"
+
+    result = {
+        "editable_files": editable_files,
+        "relevant_symbols": relevant_symbols,
+        "read_files": read_files,
+        "suggested_test_cmd": suggested_test_cmd,
+        "suggested_tier": suggested_tier,
+        "confidence": confidence,
+        "tokens_sent": tokens_sent,
+        "cache_write": cache_write,
+        "cache_hit": cache_hit,
+        "tokens_rcvd": tokens_rcvd,
+        "cost_usd": cost_msg,
+        "session_cost_usd": cost_session,
+    }
+
+    if as_json:
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+    else:
+        print("[SCOPE] Repo inspection result:")
+        print(f"  Confidence      : {confidence}")
+        print(f"  Suggested tier  : {suggested_tier}")
+        print(f"  Editable files  : {', '.join(editable_files) or '(none)'}")
+        print(f"  Relevant symbols: {', '.join(relevant_symbols) or '(none)'}")
+        print(f"  Read files      : {', '.join(read_files) or '(none)'}")
+        print(f"  Test command    : {suggested_test_cmd or '(none)'}")
+        print(f"  Tokens sent     : {tokens_sent}")
+        print(f"  Cost (USD)      : ${cost_msg} (session ${cost_session})")
+    return result
 
 
 @contextmanager
@@ -1988,6 +2351,8 @@ def main():
                                  help="Stage 1 planning: propose architecture, do not edit files")
     dispatch_parser.add_argument("--restore", action="store_true",
                                  help="Restore prior session history when dispatch resumes a session")
+    dispatch_parser.add_argument("--auto-scope", action="store_true",
+                                 help="Run the Smart Pre-Task Repo Inspection Gateway when --files is omitted")
     dispatch_parser.add_argument("--count", type=int, default=5, help="Search result count when routed to Tier 4 research (1-50, default 5)")
     dispatch_parser.add_argument("--need-content", action="store_true", help="Include full page content when routed to Tier 4 research")
     dispatch_parser.add_argument("--json", action="store_true", help="Emit raw JSON response when routed to Tier 4 research")
@@ -2027,6 +2392,15 @@ def main():
                                help="Emit raw JSON response instead of formatted text")
     search_parser.add_argument("--cwd", default=".", help="Project working directory")
 
+    scope_parser = subparsers.add_parser("scope", help="Inspect repo scope via Aider context mode")
+    scope_parser.add_argument("--message", required=True, help="Task/spec to scope")
+    scope_parser.add_argument("--cwd", default=".", help="Project working directory")
+    scope_parser.add_argument("--map-tokens", type=int, default=1536, help="Repo-map token budget (default: 1536)")
+    scope_parser.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
+    scope_parser.add_argument("--model", default="deepseek/deepseek-flash", help="Model name (default: deepseek/deepseek-flash)")
+    scope_parser.add_argument("--thinking", default="off", choices=["auto", "on", "off"], help="DeepSeek thinking mode")
+    scope_parser.add_argument("-v", "--verbose", action="store_true", help="Include full thinking traces in output")
+
     args = parser.parse_args()
     cwd_path = Path(getattr(args, "cwd", ".")).resolve()
     
@@ -2051,7 +2425,7 @@ def main():
                      auto_merge=not args.no_auto_merge, verbose=args.verbose,
                      plan_align=args.plan_align, restore=args.restore,
                      count=args.count, need_content=args.need_content,
-                     as_json=args.json)
+                     as_json=args.json, auto_scope=args.auto_scope)
     elif args.command == "cleanup":
         cleanup_session(args.task_id, cwd_path)
     elif args.command == "inspect":
@@ -2070,6 +2444,10 @@ def main():
     elif args.command == "search":
         run_search(args.query, cwd_path, count=args.count,
                    need_content=args.need_content, as_json=args.json)
+    elif args.command == "scope":
+        run_scope(args.message, cwd_path, map_tokens=args.map_tokens,
+                  as_json=args.json, model=args.model, thinking=args.thinking,
+                  verbose=args.verbose)
 
 
 if __name__ == "__main__":
