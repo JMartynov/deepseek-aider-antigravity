@@ -752,6 +752,7 @@ def extract_questions(output: str):
     output = strip_thinking_block(output)
     lines = output.splitlines()
     questions = []
+    seen_questions = set()
     current_q = None
     q_indent = 0
     fence_len = None
@@ -786,7 +787,10 @@ def extract_questions(output: str):
         if current_q is not None:
             joined = "\n".join(current_q).strip()
             if joined:
-                questions.append(joined)
+                norm = re.sub(r"\s+", " ", joined).strip().lower()
+                if norm not in seen_questions:
+                    seen_questions.add(norm)
+                    questions.append(joined)
         current_q = None
         options_bracket_depth = 0
 
@@ -970,6 +974,8 @@ def check_diff_applied_successfully(output: str):
     ])
     for pattern in failure_patterns:
         if re.search(pattern, clean_output, re.IGNORECASE):
+            if 'reflections' in pattern and re.search(r'Applied edit to\s+', clean_output):
+                continue
             return False
     return True
 
@@ -1933,6 +1939,7 @@ def run_turn(task_id: str, message: str, files: list[str], cwd: Path,
         "--no-show-release-notes",
         "--no-detect-urls",
         "--no-gitignore",
+        "--no-suggest-shell-commands",
         "--chat-history-file", str(session_file),
         "--yes-always",
         "--no-auto-commits",
@@ -2001,13 +2008,13 @@ def run_turn(task_id: str, message: str, files: list[str], cwd: Path,
         cmd.append(f)
         
     print(f"--- Running Aider Turn [Task: {task_id}] (restore={restore}, plan_align={plan_align}) ---")
+    run_kwargs = {"cwd": cwd, "capture_output": True, "text": True}
+    if (session_root / ".venv").is_dir() and "UV_PROJECT_ENVIRONMENT" not in os.environ:
+        env = os.environ.copy()
+        env["UV_PROJECT_ENVIRONMENT"] = str((session_root / ".venv").resolve())
+        run_kwargs["env"] = env
     try:
-        proc = subprocess.run(
-            cmd,
-            cwd=cwd,
-            capture_output=True,
-            text=True
-        )
+        proc = subprocess.run(cmd, **run_kwargs)
     except Exception as e:
         rollback_target_files(files, cwd)
         state["status"] = "FAILED"

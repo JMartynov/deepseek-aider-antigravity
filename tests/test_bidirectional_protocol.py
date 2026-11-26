@@ -15,6 +15,19 @@ sys.path.insert(0, str(SCRIPTS_DIR))
 import aider_bridge
 
 
+def test_extract_questions_deduplicates_identical_blocks():
+    output = (
+        "QUESTION: Which DB driver?\n"
+        "Applied edit to foo.py\n"
+        "QUESTION: Which   DB   driver?\n"
+        "QUESTION: Which cache backend?\n"
+    )
+    qs = aider_bridge.extract_questions(output)
+    assert len(qs) == 2
+    assert qs[0] == "Which DB driver?"
+    assert "cache backend" in qs[1]
+
+
 def test_question_inside_thinking_block_is_ignored():
     output = (
         "► **THINKING**\n"

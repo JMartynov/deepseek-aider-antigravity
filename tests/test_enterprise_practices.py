@@ -15,6 +15,9 @@ import tempfile
 import subprocess
 import urllib.error
 from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
 
 SCRIPTS_DIR = Path(__file__).resolve().parent.parent / "scripts"
 sys.path.insert(0, str(SCRIPTS_DIR))
@@ -1258,3 +1261,134 @@ def test_run_turn_reflection_and_decode_stalls_exit_11_and_mark_failed(monkeypat
             (tmp_path / ".aider-sessions" / task_id / "state.json").read_text()
         )
         assert state["status"] == "FAILED"
+
+
+# ---------------------------------------------------------------------------
+# UV_PROJECT_ENVIRONMENT auto-export, shell-suggestion suppression, and
+# reflection-loop false-positive regression tests
+# ---------------------------------------------------------------------------
+
+def _invoke_turn_capture_env(monkeypatch, tmppath, argv_tail):
+    """Run main() with a mock that accepts env and captures the aider invocation."""
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
+    captured = {}
+
+    def mock_run(cmd, cwd=None, capture_output=True, text=True, env=None):
+        if cmd and cmd[0] == "uvx":
+            captured["cmd"] = list(cmd)
+            captured["env"] = env
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(aider_bridge.subprocess, "run", mock_run)
+    monkeypatch.setattr(aider_bridge, "fetch_account_balance", lambda *a, **k: None)
+    monkeypatch.setattr(
+        sys, "argv",
+        ["aider_bridge.py", "turn"] + argv_tail + ["--cwd", str(tmppath)],
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        aider_bridge.main()
+    assert exc.value.code == 0
+    assert "cmd" in captured
+    return captured
+
+
+def test_uv_project_environment_set_from_session_root_venv(monkeypatch, tmp_path):
+    monkeypatch.delenv("UV_PROJECT_ENVIRONMENT", raising=False)
+    (tmp_path / ".venv").mkdir()
+    captured = _invoke_turn_capture_env(
+        monkeypatch, tmp_path,
+        ["--task-id", "uv_nonwt", "--message", "m", "--files", "foo.py"],
+    )
+    assert captured["env"] is not None
+    assert captured["env"]["UV_PROJECT_ENVIRONMENT"] == str((tmp_path / ".venv").resolve())
+
+
+def test_uv_project_environment_set_in_worktree_mode(monkeypatch, tmp_path):
+    monkeypatch.delenv("UV_PROJECT_ENVIRONMENT", raising=False)
+    (tmp_path / ".venv").mkdir()
+    captured = _invoke_turn_capture_env(
+        monkeypatch, tmp_path,
+        ["--task-id", "uv_wt", "--message", "m", "--files", "foo.py",
+         "--worktree", "--no-auto-merge"],
+    )
+    assert captured["env"] is not None
+    assert captured["env"]["UV_PROJECT_ENVIRONMENT"] == str((tmp_path / ".venv").resolve())
+
+
+def test_uv_project_environment_not_overwritten_when_already_set(monkeypatch, tmp_path):
+    monkeypatch.setenv("UV_PROJECT_ENVIRONMENT", "/custom/env")
+    (tmp_path / ".venv").mkdir()
+    captured = _invoke_turn_capture_env(
+        monkeypatch, tmp_path,
+        ["--task-id", "uv_preset", "--message", "m", "--files", "foo.py"],
+    )
+    # env dict must not be injected so the pre-set os.environ value is preserved
+    assert captured["env"] is None
+
+
+def test_no_suggest_shell_commands_flag_in_run_turn(monkeypatch, tmp_path):
+    captured = _invoke_turn_capture_env(
+        monkeypatch, tmp_path,
+        ["--task-id", "nosugg", "--message", "m", "--files", "foo.py"],
+    )
+    assert "--no-suggest-shell-commands" in captured["cmd"]
+
+
+def test_no_suggest_shell_commands_flag_in_worktree_mode(monkeypatch, tmp_path):
+    captured = _invoke_turn_capture_env(
+        monkeypatch, tmp_path,
+        ["--task-id", "nosugg_wt", "--message", "m", "--files", "foo.py",
+         "--worktree", "--no-auto-merge"],
+    )
+    assert "--no-suggest-shell-commands" in captured["cmd"]
+
+
+def test_reflection_with_applied_edit_returns_true():
+    text = (
+        "Applied edit to foo.py\n"
+        "Only 3 reflections " "allowed, stopping.\n"
+    )
+    assert aider_bridge.check_diff_applied_successfully(text) is True
+
+
+def test_reflection_without_applied_edit_returns_false():
+    text = "Only 3 reflections " "allowed, stopping.\n"
+    assert aider_bridge.check_diff_applied_successfully(text) is False
+
+
+def test_run_turn_reflection_with_applied_edit_exits_0(monkeypatch, tmp_path):
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
+    monkeypatch.setattr(aider_bridge, "fetch_account_balance", lambda *a, **k: None)
+    stdout = (
+        "Applied edit to foo.py\n"
+        "Only 3 reflections " "allowed, stopping.\n"
+    )
+    monkeypatch.setattr(
+        aider_bridge.subprocess, "run",
+        lambda *a, **k: SimpleNamespace(returncode=0, stdout=stdout, stderr=""),
+    )
+    with pytest.raises(SystemExit) as exc:
+        aider_bridge.run_turn("refl_ok", "Implement feature", ["foo.py"], tmp_path)
+    assert exc.value.code == 0
+    state = json.loads(
+        (tmp_path / ".aider-sessions" / "refl_ok" / "state.json").read_text()
+    )
+    assert state["status"] == "COMPLETED"
+
+
+def test_run_turn_reflection_without_applied_edit_exits_11(monkeypatch, tmp_path):
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
+    monkeypatch.setattr(aider_bridge, "fetch_account_balance", lambda *a, **k: None)
+    stdout = "Only 3 reflections " "allowed, stopping.\n"
+    monkeypatch.setattr(
+        aider_bridge.subprocess, "run",
+        lambda *a, **k: SimpleNamespace(returncode=0, stdout=stdout, stderr=""),
+    )
+    with pytest.raises(SystemExit) as exc:
+        aider_bridge.run_turn("refl_fail", "Implement feature", ["foo.py"], tmp_path)
+    assert exc.value.code == 11
+    state = json.loads(
+        (tmp_path / ".aider-sessions" / "refl_fail" / "state.json").read_text()
+    )
+    assert state["status"] == "FAILED"
