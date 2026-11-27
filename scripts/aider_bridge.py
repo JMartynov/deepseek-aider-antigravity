@@ -307,7 +307,8 @@ ESCALATE_CATEGORIES = frozenset({
 })
 
 
-def _resolve_tier_params(tier: str, test_cmd: str = None, message: str = "") -> dict:
+def _resolve_tier_params(tier: str, test_cmd: str = None, message: str = "",
+                         files: list[str] = None, auto_scope: bool = False) -> dict:
     """Build the resolved Aider/search parameter dict for a given precision tier."""
     if tier == "patch":
         return {
@@ -331,7 +332,7 @@ def _resolve_tier_params(tier: str, test_cmd: str = None, message: str = "") -> 
             "thinking": "auto",
             "reasoning_effort": "low",
             "edit_format": "diff",
-            "map_tokens": 512,
+            "map_tokens": 0 if (files and not auto_scope) else 512,
             "architect": False,
             "editor_model": None,
             "plan_align": False,
@@ -348,7 +349,7 @@ def _resolve_tier_params(tier: str, test_cmd: str = None, message: str = "") -> 
             "map_tokens": 512,
             "architect": True,
             "editor_model": "deepseek/deepseek-flash",
-            "plan_align": True,
+            "plan_align": False,
             "test_cmd": test_cmd,
         }
     return {
@@ -375,7 +376,7 @@ def _has_keyword(text: str, keywords: tuple[str, ...]) -> bool:
 
 def classify_task(message: str, files: list[str] = None,
                   read_files: list[str] = None, test_cmd: str = None,
-                  forced_tier: str = "auto") -> tuple[str, str, dict]:
+                  forced_tier: str = "auto", auto_scope: bool = False) -> tuple[str, str, dict]:
     """
     Rule-engine that classifies a task into a precision tier and returns
     (tier_name, reasoning, resolved_params).
@@ -391,27 +392,29 @@ def classify_task(message: str, files: list[str] = None,
                 f"Unsupported tier {forced_tier!r}; expected one of {SUPPORTED_TIERS} or 'auto'."
             )
         reason = f"manual override (--tier {tier})"
-        return tier, reason, _resolve_tier_params(tier, test_cmd=test_cmd, message=message)
+        return tier, reason, _resolve_tier_params(tier, test_cmd=test_cmd, message=message, files=files, auto_scope=auto_scope)
 
     # Tier 4: Research (no editable files + research intent or missing test contract)
     if not files and (_has_keyword(msg, RESEARCH_KEYWORDS) or not test_cmd):
         reason = "no editable files with research/lookup intent or no --test-cmd"
-        return "research", reason, _resolve_tier_params("research", message=message)
+        return "research", reason, _resolve_tier_params("research", message=message, files=files, auto_scope=auto_scope)
+
+    # Doc/config-only edits route to quick patch before architectural escalation
+    if files and not test_cmd and all(Path(f).suffix.lower() in DOC_CONFIG_EXTENSIONS for f in files):
+        reason = f"{len(files)} doc/config file(s) with no --test-cmd"
+        return "patch", reason, _resolve_tier_params("patch", test_cmd=test_cmd, message=message, files=files, auto_scope=auto_scope)
 
     # Tier 3: Architect (many files or complex/AST/concurrency/security keywords)
-    if len(files) > 3 or _has_keyword(msg, ARCHITECT_KEYWORDS):
+    if len(files) > 5 or _has_keyword(msg, ARCHITECT_KEYWORDS):
         reason = f"{len(files)} target file(s) or complex/AST/architecture keywords"
-        return "architect", reason, _resolve_tier_params("architect", test_cmd=test_cmd, message=message)
+        return "architect", reason, _resolve_tier_params("architect", test_cmd=test_cmd, message=message, files=files, auto_scope=auto_scope)
 
-    # Tier 1: Quick patch (single doc/config file or mechanical keywords, no tests)
-    if len(files) == 1 and not test_cmd and (
-        str(files[0]).lower().endswith(DOC_CONFIG_EXTENSIONS)
-        or _has_keyword(msg, PATCH_KEYWORDS)
-    ):
-        reason = "single doc/config file or mechanical patch keywords"
-        return "patch", reason, _resolve_tier_params("patch", test_cmd=test_cmd, message=message)
+    # Tier 1: Quick patch (single file with mechanical keywords, no tests)
+    if len(files) == 1 and not test_cmd and _has_keyword(msg, PATCH_KEYWORDS):
+        reason = "single file with mechanical patch keywords"
+        return "patch", reason, _resolve_tier_params("patch", test_cmd=test_cmd, message=message, files=files, auto_scope=auto_scope)
 
-    # Tier 2: Surgical (default for 1-3 domain files / localized work / active tests)
+    # Tier 2: Surgical (default for 1-5 domain files / localized work / active tests)
     reason = f"{len(files)} domain file(s)"
     if test_cmd:
         reason += " with active --test-cmd"
@@ -430,7 +433,7 @@ def run_dispatch(task_id: str, message: str, files: list[str], cwd: Path,
                  restore: bool = False, count: int = 5,
                  need_content: bool = False, as_json: bool = False,
                  auto_scope: bool = False,
-                 max_context_kb: int = 256,
+                 max_context_kb: int = 128,
                  allow_large_context: bool = False):
     """
     Classify a task into its optimal precision tier and dispatch it to the
@@ -442,6 +445,7 @@ def run_dispatch(task_id: str, message: str, files: list[str], cwd: Path,
         print(f"[ERROR] Security violation: {e}", file=sys.stderr)
         sys.exit(12)
 
+    auto_scoped = bool(auto_scope and not files)
     if auto_scope and not files:
         scope_result = run_scope(message=message, cwd=cwd)
         if (scope_result or {}).get("confidence") == "low" or not (scope_result or {}).get("editable_files"):
@@ -461,7 +465,7 @@ def run_dispatch(task_id: str, message: str, files: list[str], cwd: Path,
 
     tier_name, reasoning, resolved = classify_task(
         message, files=files, read_files=read_files,
-        test_cmd=test_cmd, forced_tier=tier,
+        test_cmd=test_cmd, forced_tier=tier, auto_scope=auto_scoped,
     )
 
     # Explicit CLI overrides win over tier defaults
@@ -1856,7 +1860,7 @@ def run_turn(task_id: str, message: str, files: list[str], cwd: Path,
              verbose: bool = False, thinking: str = "off",
              reasoning_effort: str = None, map_tokens: int = 0,
              plan_align: bool = False, session_root: Path = None,
-             tier: str = None, max_context_kb: int = 256,
+             tier: str = None, max_context_kb: int = 128,
              allow_large_context: bool = False,
              _is_suppress_retry: bool = False):
     try:
@@ -2020,7 +2024,7 @@ def run_turn(task_id: str, message: str, files: list[str], cwd: Path,
     if restore:
         full_message = message
     elif plan_align:
-        full_message = f"{system_rules}\n\n{planning_rules}\n\nTask: {message}"
+        full_message = f"{planning_rules}\n\nTask: {message}"
     else:
         full_message = f"{system_rules}\n\nTask: {message}"
     
@@ -2224,7 +2228,7 @@ def run_turn(task_id: str, message: str, files: list[str], cwd: Path,
             sys.exit(10)
         
     # Check if diff failed to apply
-    if not check_diff_applied_successfully(combined_output):
+    if not plan_align and not check_diff_applied_successfully(combined_output):
         rollback_target_files(files, cwd)
         state["status"] = "FAILED"
         _write_state_atomic(state_file, state)
@@ -2416,13 +2420,30 @@ def reply_session(task_id: str, answer: str, cwd: Path,
         raise
 
 
+def _resolve_cli_message(args, cwd_path: Path, parser: argparse.ArgumentParser) -> str:
+    """Resolve the task message from --message-file (preferred) or --message."""
+    message_file = getattr(args, "message_file", None)
+    if message_file:
+        candidate = Path(message_file)
+        if not candidate.is_absolute() and not candidate.exists():
+            candidate = cwd_path / message_file
+        if not candidate.is_file():
+            print(f"[ERROR] Message file not found: {message_file}", file=sys.stderr)
+            sys.exit(2)
+        return candidate.read_text(encoding="utf-8")
+    if getattr(args, "message", None) is None:
+        parser.error("one of --message or --message-file is required")
+    return args.message
+
+
 def main():
     parser = argparse.ArgumentParser(description="Token-Sparse Aider Sub-Agent Orchestrator")
     subparsers = parser.add_subparsers(dest="command", required=True)
     
     turn_parser = subparsers.add_parser("turn", help="Run a turn in the task session")
     turn_parser.add_argument("--task-id", required=True, help="Unique identifier for the task session")
-    turn_parser.add_argument("--message", required=True, help="Prompt/specification for the sub-agent")
+    turn_parser.add_argument("--message", default=None, help="Prompt/specification for the sub-agent")
+    turn_parser.add_argument("--message-file", default=None, help="Path to a file containing the task message (alternative to --message)")
     turn_parser.add_argument("--files", nargs="*", default=[], help="Editable target files")
     turn_parser.add_argument("--read-files", nargs="*", default=[], help="Read-only reference files")
     turn_parser.add_argument("--restore", action="store_true", help="Restore prior turn session history for prefix cache")
@@ -2440,15 +2461,16 @@ def main():
     turn_parser.add_argument("--map-tokens", type=int, default=0, help="Aider repo-map token budget (default: 0)")
     turn_parser.add_argument("--plan-align", action="store_true",
                              help="Stage 1 planning: propose architecture, do not edit files")
-    turn_parser.add_argument("--max-context-kb", type=int, default=256,
-                             help="Maximum total requested context size in KB before the cost guard trips (default: 256)")
+    turn_parser.add_argument("--max-context-kb", type=int, default=128,
+                             help="Maximum total requested context size in KB before the cost guard trips (default: 128)")
     turn_parser.add_argument("--allow-large-context", action="store_true",
                              help="Allow requests whose total context exceeds --max-context-kb")
     turn_parser.add_argument("--cwd", default=".", help="Project working directory")
 
     dispatch_parser = subparsers.add_parser("dispatch", help="Auto-classify and dispatch a task to the optimal tier")
     dispatch_parser.add_argument("--task-id", required=True, help="Unique identifier for the task session")
-    dispatch_parser.add_argument("--message", required=True, help="Task specification / research query")
+    dispatch_parser.add_argument("--message", default=None, help="Task specification / research query")
+    dispatch_parser.add_argument("--message-file", default=None, help="Path to a file containing the task message (alternative to --message)")
     dispatch_parser.add_argument("--files", nargs="*", default=[], help="Editable target files")
     dispatch_parser.add_argument("--read-files", nargs="*", default=[], help="Read-only reference files")
     dispatch_parser.add_argument("--model", default=None, help="Override resolved tier model")
@@ -2473,8 +2495,8 @@ def main():
     dispatch_parser.add_argument("--count", type=int, default=5, help="Search result count when routed to Tier 4 research (1-50, default 5)")
     dispatch_parser.add_argument("--need-content", action="store_true", help="Include full page content when routed to Tier 4 research")
     dispatch_parser.add_argument("--json", action="store_true", help="Emit raw JSON response when routed to Tier 4 research")
-    dispatch_parser.add_argument("--max-context-kb", type=int, default=256,
-                                 help="Maximum total requested context size in KB before the cost guard trips (default: 256)")
+    dispatch_parser.add_argument("--max-context-kb", type=int, default=128,
+                                 help="Maximum total requested context size in KB before the cost guard trips (default: 128)")
     dispatch_parser.add_argument("--allow-large-context", action="store_true",
                                  help="Allow requests whose total context exceeds --max-context-kb")
     dispatch_parser.add_argument("--cwd", default=".", help="Project working directory")
@@ -2526,7 +2548,8 @@ def main():
     cwd_path = Path(getattr(args, "cwd", ".")).resolve()
     
     if args.command == "turn":
-        run_turn(args.task_id, args.message, args.files, cwd_path, 
+        message = _resolve_cli_message(args, cwd_path, turn_parser)
+        run_turn(args.task_id, message, args.files, cwd_path, 
                  read_files=args.read_files, restore=args.restore, model=args.model,
                  lint_cmd=args.lint_cmd, test_cmd=args.test_cmd,
                  dry_run=args.dry_run, architect=args.architect,
@@ -2537,7 +2560,8 @@ def main():
                  max_context_kb=args.max_context_kb,
                  allow_large_context=args.allow_large_context)
     elif args.command == "dispatch":
-        run_dispatch(args.task_id, args.message, args.files, cwd_path,
+        message = _resolve_cli_message(args, cwd_path, dispatch_parser)
+        run_dispatch(args.task_id, message, args.files, cwd_path,
                      read_files=args.read_files, test_cmd=args.test_cmd,
                      lint_cmd=args.lint_cmd, model=args.model,
                      editor_model=args.editor_model, map_tokens=args.map_tokens,
