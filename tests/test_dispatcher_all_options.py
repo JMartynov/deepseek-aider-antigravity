@@ -7,6 +7,7 @@ import json
 import sys
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -121,7 +122,7 @@ def test_tier2_surgical_exact_resolved_params():
         "thinking": "auto",
         "reasoning_effort": "low",
         "edit_format": "diff",
-        "map_tokens": 512,
+        "map_tokens": 0,
         "architect": False,
         "editor_model": None,
         "plan_align": False,
@@ -149,15 +150,19 @@ def test_tier3_architect_all_keywords_and_exact_params(kw):
         "map_tokens": 512,
         "architect": True,
         "editor_model": "deepseek/deepseek-flash",
-        "plan_align": True,
+        "plan_align": False,
         "test_cmd": "pytest -q",
     }
 
 
 def test_tier3_architect_file_count_threshold():
-    # 3 files -> surgical; 4 files -> architect
-    t3_below, _, _ = aider_bridge.classify_task("Update modules", files=["a.py", "b.py", "c.py"])
-    t3_above, _, _ = aider_bridge.classify_task("Update modules", files=["a.py", "b.py", "c.py", "d.py"])
+    # 5 files -> surgical; 6 files -> architect
+    t3_below, _, _ = aider_bridge.classify_task(
+        "Update modules", files=["a.py", "b.py", "c.py", "d.py", "e.py"]
+    )
+    t3_above, _, _ = aider_bridge.classify_task(
+        "Update modules", files=["a.py", "b.py", "c.py", "d.py", "e.py", "f.py"]
+    )
     assert t3_below == "surgical"
     assert t3_above == "architect"
 
@@ -338,7 +343,7 @@ def test_dispatch_tier3_restore_disables_default_plan_align(monkeypatch):
         "aider_bridge.py", "dispatch",
         "--task-id", "t3_restore",
         "--message", "Proceed with implementation",
-        "--files", "a.py", "b.py", "c.py", "d.py",
+        "--files", "a.py", "b.py", "c.py", "d.py", "e.py", "f.py",
         "--restore",
         "--cwd", ".",
     ])
@@ -552,7 +557,7 @@ def test_cli_construction_tier2_surgical_with_test_and_lint(monkeypatch):
         cmd, yaml_text = _extract_cmd_and_yaml(calls)
         assert cmd[cmd.index("--model") + 1] == "deepseek/deepseek-flash"
         assert cmd[cmd.index("--edit-format") + 1] == "diff"
-        assert cmd[cmd.index("--map-tokens") + 1] == "512"
+        assert cmd[cmd.index("--map-tokens") + 1] == "0"
         assert "--reasoning-effort" not in cmd
         assert "reasoning_effort: low" in yaml_text
         assert "--auto-test" in cmd
@@ -584,8 +589,9 @@ def test_cli_construction_tier3_stage1_plan_align(monkeypatch):
             "aider_bridge.py", "dispatch",
             "--task-id", "cli_t3_s1",
             "--message", "Refactor AST visitors",
-            "--files", "a.py", "b.py", "c.py", "d.py",
+            "--files", "a.py", "b.py", "c.py", "d.py", "e.py", "f.py",
             "--test-cmd", "pytest -q",
+            "--plan-align",
             "--cwd", str(tmppath),
         ])
         with pytest.raises(SystemExit) as exc:
@@ -604,7 +610,8 @@ def test_cli_construction_tier3_stage1_plan_align(monkeypatch):
         assert "--auto-test" not in cmd
         assert "--auto-lint" not in cmd
         msg = cmd[cmd.index("--message") + 1]
-        assert "IMPORTANT RULES" in msg
+        assert "IMPORTANT RULES" not in msg
+        assert "Output only surgical unified diffs" not in msg
         assert "STAGE 1: PLANNING ONLY" in msg
         assert "- name: deepseek/deepseek-reasoner" in yaml_text
         assert "edit_format: editor-diff" not in yaml_text
@@ -906,3 +913,151 @@ def test_cli_construction_non_deepseek_passes_thinking_and_reasoning_flags(monke
         assert yaml_text is None
         assert cmd[cmd.index("--thinking-tokens") + 1] == "0"
         assert cmd[cmd.index("--reasoning-effort") + 1] == "low"
+
+
+def test_tier1_multi_file_docs_route_to_patch_even_with_architect_keywords():
+    docs = [f"docs/page_{i}.md" for i in range(10)]
+    tier, _, params = aider_bridge.classify_task(
+        "Refactor architecture documentation across all pages", files=docs
+    )
+    assert tier == "patch"
+    assert params["tier_num"] == 1
+    assert params["model"] == "deepseek/deepseek-flash"
+    assert params["thinking"] == "off"
+    assert params["map_tokens"] == 0
+    assert params["plan_align"] is False
+
+    tier_mixed, _, _ = aider_bridge.classify_task(
+        "Refactor architecture documentation across all pages",
+        files=docs + ["core.py"],
+    )
+    assert tier_mixed == "architect"
+
+    tier_forced, _, _ = aider_bridge.classify_task(
+        "Refactor architecture documentation across all pages",
+        files=docs, forced_tier="architect",
+    )
+    assert tier_forced == "architect"
+
+
+def test_tier2_surgical_4_and_5_files_and_auto_scope_map_tokens(monkeypatch):
+    for n in (4, 5):
+        files = [f"m{i}.py" for i in range(n)]
+        tier, _, params = aider_bridge.classify_task("Update modules", files=files)
+        assert tier == "surgical"
+        assert params["map_tokens"] == 0
+
+    six = [f"m{i}.py" for i in range(6)]
+    tier, _, params = aider_bridge.classify_task("Update modules", files=six)
+    assert tier == "architect"
+    assert params["map_tokens"] == 512
+
+    tier, _, params = aider_bridge.classify_task(
+        "Update modules", files=["a.py", "b.py"], auto_scope=True
+    )
+    assert tier == "surgical"
+    assert params["map_tokens"] == 512
+
+    captured = {}
+
+    def fake_run_scope(*a, **k):
+        return {"editable_files": ["a.py", "b.py"], "confidence": "high"}
+
+    def fake_run_turn(task_id, message, files, cwd, **kwargs):
+        captured.update(kwargs)
+
+    monkeypatch.setattr(aider_bridge, "run_scope", fake_run_scope, raising=False)
+    monkeypatch.setattr(aider_bridge, "run_turn", fake_run_turn)
+    monkeypatch.setattr(sys, "argv", [
+        "aider_bridge.py", "dispatch", "--task-id", "d_scope",
+        "--message", "Implement verify_token",
+        "--auto-scope", "--cwd", ".",
+    ])
+    aider_bridge.main()
+    assert captured["map_tokens"] == 512
+
+
+def test_plan_align_omits_diff_rule_and_skips_diff_apply_failed(monkeypatch, tmp_path):
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
+    monkeypatch.setattr(aider_bridge, "fetch_account_balance", lambda *a, **k: None)
+    captured = {}
+
+    def mock_run(cmd, cwd=None, capture_output=True, text=True, env=None):
+        if cmd and cmd[0] == "uvx":
+            captured["cmd"] = list(cmd)
+            if "--chat-history-file" in cmd:
+                ch = Path(cmd[cmd.index("--chat-history-file") + 1])
+                ch.parent.mkdir(parents=True, exist_ok=True)
+                ch.touch()
+        return SimpleNamespace(
+            returncode=0,
+            stdout=(
+                "Proposed plan: split into 2 modules.\n"
+                + "Failed to apply " + "edit to app.py\n"
+            ),
+            stderr="",
+        )
+
+    monkeypatch.setattr(aider_bridge.subprocess, "run", mock_run)
+
+    with pytest.raises(SystemExit) as exc:
+        aider_bridge.run_turn(
+            "plan_nodiff", "Plan refactor", ["app.py"], tmp_path,
+            plan_align=True,
+        )
+    assert exc.value.code == 0
+    state = json.loads(
+        (tmp_path / ".aider-sessions" / "plan_nodiff" / "state.json").read_text()
+    )
+    assert state["status"] == "COMPLETED"
+    msg = captured["cmd"][captured["cmd"].index("--message") + 1]
+    assert "STAGE 1: PLANNING ONLY" in msg
+    assert "Output only surgical unified diffs" not in msg
+
+
+def test_message_file_turn_and_dispatch_and_missing_errors(monkeypatch, tmp_path, capsys):
+    prompt = "Fix `parse()` and $VAR\nLine 2"
+    pf = tmp_path / "prompt.txt"
+    pf.write_text(prompt, encoding="utf-8")
+
+    captured = {}
+
+    def fake_run_turn(task_id, message, files, cwd, **kwargs):
+        captured[task_id] = message
+
+    monkeypatch.setattr(aider_bridge, "run_turn", fake_run_turn)
+
+    monkeypatch.setattr(sys, "argv", [
+        "aider_bridge.py", "turn", "--task-id", "mf_turn",
+        "--message-file", str(pf), "--files", "foo.py", "--cwd", ".",
+    ])
+    aider_bridge.main()
+    assert captured["mf_turn"] == prompt
+
+    monkeypatch.setattr(sys, "argv", [
+        "aider_bridge.py", "dispatch", "--task-id", "mf_disp",
+        "--message-file", str(pf), "--files", "foo.py", "--cwd", ".",
+    ])
+    aider_bridge.main()
+    assert captured["mf_disp"] == prompt
+
+    for sub in ("turn", "dispatch"):
+        monkeypatch.setattr(sys, "argv", [
+            "aider_bridge.py", sub, "--task-id", f"mf_none_{sub}",
+            "--files", "foo.py", "--cwd", ".",
+        ])
+        with pytest.raises(SystemExit) as exc:
+            aider_bridge.main()
+        assert exc.value.code == 2
+
+    capsys.readouterr()
+    monkeypatch.setattr(sys, "argv", [
+        "aider_bridge.py", "turn", "--task-id", "mf_missing",
+        "--message-file", str(tmp_path / "nope.txt"),
+        "--files", "foo.py", "--cwd", ".",
+    ])
+    with pytest.raises(SystemExit) as exc:
+        aider_bridge.main()
+    assert exc.value.code == 2
+    err = capsys.readouterr().err
+    assert "[ERROR] Message file not found" in err

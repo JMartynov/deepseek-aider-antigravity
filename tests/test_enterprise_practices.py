@@ -388,7 +388,7 @@ def test_classify_task_tier2_surgical():
     assert params["model"] == "deepseek/deepseek-flash"
     assert params["thinking"] == "auto"
     assert params["reasoning_effort"] == "low"
-    assert params["map_tokens"] == 512
+    assert params["map_tokens"] == 0
     assert params["architect"] is False
     assert params["test_cmd"] == "pytest tests/test_auth.py -q"
 
@@ -402,7 +402,7 @@ def test_classify_task_tier2_surgical_no_test_cmd():
 
 def test_classify_task_tier3_architect_by_file_count():
     tier, reason, params = aider_bridge.classify_task(
-        "Implement feature", files=["a.py", "b.py", "c.py", "d.py"])
+        "Implement feature", files=["a.py", "b.py", "c.py", "d.py", "e.py", "f.py"])
     assert tier == "architect"
     assert params["tier_num"] == 3
     assert params["tier_label"] == "ARCHITECT"
@@ -538,7 +538,7 @@ def test_dispatch_routes_to_run_turn(monkeypatch):
     assert kw["test_cmd"] == "pytest tests/test_auth.py -q"
     assert kw["model"] == "deepseek/deepseek-flash"
     assert kw["thinking"] == "auto"
-    assert kw["map_tokens"] == 512
+    assert kw["map_tokens"] == 0
     assert kw["architect"] is False
 
 
@@ -1494,7 +1494,7 @@ def test_context_budget_circuit_breaker_exits_14_before_subprocess(
     captured = capsys.readouterr()
     assert "[COST-GUARD]" in captured.err
     assert "300.0 KB" in captured.err
-    assert "--max-context-kb (256 KB)" in captured.err
+    assert "--max-context-kb (128 KB)" in captured.err
     assert "Pass --allow-large-context to override." in captured.err
     assert "[STATUS] PREFLIGHT_FAILED" in captured.out
 

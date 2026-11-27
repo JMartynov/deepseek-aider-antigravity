@@ -431,14 +431,23 @@ def test_dispatch_auto_plan_align_only_for_tier3(monkeypatch):
 
     monkeypatch.setattr(aider_bridge, "run_turn", fake_run_turn)
 
-    # Tier 3 (architect) auto-enables plan_align
+    # Tier 3 (architect) no longer auto-enables plan_align
     monkeypatch.setattr(sys, "argv", [
         "aider_bridge.py", "dispatch", "--task-id", "t3_auto",
         "--message", "Refactor the concurrency lock architecture", "--files", "lock.py",
         "--cwd", ".",
     ])
     aider_bridge.main()
-    assert captured["t3_auto"]["plan_align"] is True
+    assert captured["t3_auto"]["plan_align"] is False
+
+    # Explicit opt-in via --plan-align
+    monkeypatch.setattr(sys, "argv", [
+        "aider_bridge.py", "dispatch", "--task-id", "t3_opt_in",
+        "--message", "Refactor the concurrency lock architecture", "--files", "lock.py",
+        "--plan-align", "--cwd", ".",
+    ])
+    aider_bridge.main()
+    assert captured["t3_opt_in"]["plan_align"] is True
 
     # Tier 1 (patch) keeps plan_align=False
     monkeypatch.setattr(sys, "argv", [
