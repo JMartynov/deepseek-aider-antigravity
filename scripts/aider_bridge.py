@@ -418,7 +418,10 @@ def classify_task(message: str, files: list[str] = None,
     reason = f"{len(files)} domain file(s)"
     if test_cmd:
         reason += " with active --test-cmd"
-    return "surgical", reason, _resolve_tier_params("surgical", test_cmd=test_cmd, message=message)
+    return "surgical", reason, _resolve_tier_params(
+        "surgical", test_cmd=test_cmd, message=message,
+        files=files, auto_scope=auto_scope,
+    )
 
 
 def run_dispatch(task_id: str, message: str, files: list[str], cwd: Path,
