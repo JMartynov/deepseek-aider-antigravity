@@ -15,7 +15,7 @@ Designed for intense daily programming workflows (up to 5 hours/day) while stric
 - **Turn-Based Question Intercept**: If specifications are ambiguous, DeepSeek pauses with `QUESTION: <question>`, exiting cleanly with code `10`. Antigravity resolves the question and resumes the session under DeepSeek's server-side prefix cache (~90–98% discount).
 - **Live Balance & Token Telemetry**: Automatically queries `https://api.deepseek.com/user/balance` after every turn, logging tokens sent, cache hits, turn cost, session cost, and live account balance.
 - **Dynamic Secret Shield (`.aiderignore`)**: Injects an ephemeral `.aiderignore` before each run, ensuring `.env*`, `*.pem`, `*.key`, `node_modules/`, cache directories, bulk data/lockfile/JSON payloads (`docs/data/`, `data/`, `*.csv`, `*.parquet`, `*.json`, `uv.lock`, `package-lock.json`, `pnpm-lock.yaml`, `yarn.lock`, `web/catalog.json`), and any unrequested file >100 KB are never passed to the remote LLM (explicit `--files`/`--read-files` are re-exempted via sorted `!` negations).
-- **Cost-Saving Guards**: `turn` defaults to `--thinking off` (dispatch Tiers 2/3 still resolve `auto`/`low` and `on`/`high`), and a hard context-budget circuit breaker — `--max-context-kb` (default `256`) with `--allow-large-context` to bypass — exits `14` (`PREFLIGHT_FAILED`) before calling DeepSeek when the deduplicated `--files` + `--read-files` total exceeds the budget.
+- **Cost-Saving Guards**: `turn` defaults to `--thinking off` (dispatch Tiers 2/3 still resolve `auto`/`low` and `on`/`high`), and a hard context-budget circuit breaker — `--max-context-kb` (default `128`) with `--allow-large-context` to bypass — exits `14` (`PREFLIGHT_FAILED`) before calling DeepSeek when the deduplicated `--files` + `--read-files` total exceeds the budget.
 - **Atomic Rollback on Diff Collisions**: Automatically reverts modified tracked files via `git checkout` and purges incomplete untracked files if an edit fails to apply.
 - **Universal Auto-Lint**: Defaults to `python:python -m py_compile` (or custom `--lint-cmd`) so DeepSeek catches and self-heals syntax errors within the same turn.
 - **Read-Only Scope Protection**: Supports `--read-files` to open reference schemas and interfaces with `--read`, preventing accidental edits to read-only code.
@@ -175,7 +175,7 @@ python3 scripts/aider_bridge.py turn \
   --cwd "<project_dir>"
 ```
 
-Forbids file edits — DeepSeek analyzes scope and emits a structured `QUESTION: [STAGE: PLANNING] …`. Session state becomes `AWAITING_PLAN_APPROVAL`; use `reply` to resolve, then `merge-worktree`.
+Opt-in only (not auto-enabled on Tier 3). Forbids file edits — DeepSeek analyzes scope and emits a structured `QUESTION: [STAGE: PLANNING] …`; Stage 1 omits the surgical-diff rule and never fails with `DIFF_APPLY_FAILED` on read-only output. Session state becomes `AWAITING_PLAN_APPROVAL`; use `reply` to resolve, then `merge-worktree`.
 
 ### Structured `QUESTION:` Contract
 
@@ -225,6 +225,7 @@ python3 scripts/aider_bridge.py turn \
 ```
 
 - **Exit `5` (`MERGE_BLOCKED`)** — `merge-worktree` was blocked because `state.json` status is `AWAITING_*`; call `reply` first.
+- **`--message-file <path>`** — read the task message from a UTF-8 file instead of `--message` (avoids shell backtick/escaping mangling); supported by `turn` and `dispatch`.
 
 ### Web Search Delegation
 
@@ -255,12 +256,12 @@ python3 scripts/aider_bridge.py dispatch \
 
 | Tier | Label | Trigger | Model / Thinking | Test-Cmd |
 | :---: | :--- | :--- | :--- | :--- |
-| 1 | `PATCH` | 1 doc/config file or patch keywords (typo, lint, bump, version, docstring, comment, readme, format, rename); no `--test-cmd` | `deepseek-flash` / `off` | off |
-| 2 | `SURGICAL` | 1–3 domain files, localized work, or active `--test-cmd` | `deepseek-flash` / `auto` (low) | active |
-| 3 | `ARCHITECT` | >3 files or complex/AST/concurrency keywords | `deepseek-reasoner` + `flash` editor / `on` (high) | active |
+| 1 | `PATCH` | Any number of doc/config-only files (`.md/.txt/.rst/.toml/.yaml/.yml/.json/.ini/.cfg`) or patch keywords (typo, lint, bump, version, docstring, comment, readme, format, rename); no `--test-cmd` — takes precedence over file-count/architect keywords unless `--tier architect` is forced | `deepseek-flash` / `off` | off |
+| 2 | `SURGICAL` | 1–5 non-doc files, localized work, or active `--test-cmd` | `deepseek-flash` / `auto` (low) | active |
+| 3 | `ARCHITECT` | >5 non-doc files or complex/AST/concurrency keywords | `deepseek-reasoner` + `flash` editor / `on` (high) | active |
 | 4 | `RESEARCH` | No editable files with research intent, or no `--test-cmd` | DeepSeek `search` API | n/a |
 
-Flags: `--tier {auto,patch,surgical,architect,research}`, `--model`, `--editor-model`, `--architect`, `--thinking {auto,on,off}`, `--reasoning-effort {low,high,max}`, `--map-tokens`, `--lint-cmd`, `--test-cmd`, `--dry-run`, `--worktree`, `--no-auto-merge`, `-v/--verbose`, `--plan-align`, `--restore` (resumes a session on dispatch), `--auto-scope` (auto-run `scope` when `--files` is omitted), `--count`, `--need-content`, `--json` (Tier 4 research).
+Flags: `--tier {auto,patch,surgical,architect,research}`, `--model`, `--editor-model`, `--architect`, `--thinking {auto,on,off}`, `--reasoning-effort {low,high,max}`, `--map-tokens`, `--lint-cmd`, `--test-cmd`, `--dry-run`, `--worktree`, `--no-auto-merge`, `-v/--verbose`, `--plan-align`, `--message-file <path>`, `--restore` (resumes a session on dispatch), `--auto-scope` (auto-run `scope` when `--files` is omitted), `--count`, `--need-content`, `--json` (Tier 4 research).
 
 #### 2-Route Smart Pre-Task Repo Inspection Gateway
 
@@ -288,16 +289,17 @@ python3 scripts/aider_bridge.py dispatch \
 | **Models** | `--editor-model` | `turn`, `dispatch` | Sets editor model in `--architect` mode (`editor-diff`, thinking disabled). Auto-defaults to `deepseek/deepseek-flash` for `reasoner` and `v4-pro`. | Leave default for cost-optimal two-model editing; override only when a specialized editor model is required. |
 | **Reasoning** | `--thinking {auto,on,off}` | `turn`, `dispatch` | Controls `extra_params.thinking.type` in ephemeral YAML and passes `--thinking-tokens 0` when `off`. `turn` defaults to `off` (cost guard); `dispatch` keeps Tier 2 `auto`/`low` and Tier 3 `on`/`high`. | `off` for typos/docs/config (Tier 1); `auto` for localized code (Tier 2); `on` for complex design/debugging (Tier 3). |
 | **Reasoning** | `--reasoning-effort {low,high,max}` | `turn`, `dispatch` | Sets `extra_params.reasoning_effort` and `--reasoning-effort` CLI flag. | `low` for surgical fixes; `high` for multi-file refactors; `max` for subtle concurrency/security invariants. |
-| **Execution** | `--architect` | `turn`, `dispatch` | Enables two-model architect + editor workflow (`--architect`). Suppressed during Stage 1 `--plan-align`. | Multi-file (>3) or structural refactors where planning separates from diff emission. |
-| **Execution** | `--plan-align` | `turn`, `dispatch` | Stage 1 read-only `--chat-mode ask`; forbids edits and escalates structured `QUESTION: [STAGE: PLANNING]`. | Auto-enabled on Tier 3 (unless `--restore`); pass explicitly when architectural alignment is needed first. |
+| **Execution** | `--architect` | `turn`, `dispatch` | Enables two-model architect + editor workflow (`--architect`). Suppressed during Stage 1 `--plan-align`. | Multi-file (>5 non-doc) or structural refactors where planning separates from diff emission. |
+| **Execution** | `--plan-align` | `turn`, `dispatch` | Opt-in Stage 1 read-only `--chat-mode ask`; forbids edits and escalates structured `QUESTION: [STAGE: PLANNING]`. Planning omits the surgical-diff rule and never fails with `DIFF_APPLY_FAILED` on read-only output. | Opt-in only (NOT auto-enabled on Tier 3); pass explicitly when architectural alignment is needed first. |
 | **Execution** | `--dry-run` | `turn`, `dispatch` | On `dispatch`, prints tier classification + resolved params without running; on `turn`, passes `--dry-run` to Aider. | Verify dispatcher routing (`dispatch --dry-run`) or preview diffs without disk writes (`turn --dry-run`). |
 | **Execution** | `--restore` | `turn`, `dispatch` | Passes `--restore-chat-history` and omits re-prepending `system_rules` to preserve ~90%+ prefix cache. | Resuming after exit `10` or continuing an existing task session (e.g., Tier 3 Stage 2 via `dispatch`). |
 | **Execution** | `--worktree` / `--no-auto-merge` | `turn`, `dispatch` | Runs in `.worktrees/<task_id>` (`task/<task_id>`); `--no-auto-merge` keeps branch for review before `merge-worktree`. | Parallel sub-agents or multi-pass TDD/review workflows requiring clean branch isolation. |
 | **Quality** | `--test-cmd <cmd>` | `turn`, `dispatch` | Wires `--auto-test --test-cmd <cmd>` so Aider self-heals failing tests in the same turn. | Any bugfix/feature with tests (closed-loop TDD); auto-upgrades Tier 1 doc edits to Tier 2 `surgical`. |
 | **Quality** | `--lint-cmd <cmd>` | `turn`, `dispatch` | Wires `--auto-lint --lint-cmd <cmd>` (auto-defaults to `python:python -m py_compile` for `.py` files). | Pass custom linters (e.g., `ruff check`, `eslint`) to catch & self-heal lint errors in-turn. |
 | **Context** | `--files` / `--read-files` | `turn`, `dispatch` | `--files` are editable targets; `--read-files` open read-only via `--read` (preflight fails exit `14` if missing). | Always scope strictly to explicit paths; protect interfaces/schemas/specs with `--read-files`. |
-| **Context** | `--map-tokens <N>` | `turn`, `dispatch` | Sets Aider `--map-tokens` repo-map budget (Tier 1/4: `0`, Tier 2/3: `512`). | Keep `0` for isolated single-file edits; `512`+ when cross-file symbol awareness is needed. |
-| **Cost Guard** | `--max-context-kb <N>` / `--allow-large-context` | `turn`, `dispatch` | Hard context-budget circuit breaker: deduplicates `--files` + `--read-files` on resolved paths and, if their total size exceeds `N` KB (default `256`), prints `[COST-GUARD]` + `[STATUS] PREFLIGHT_FAILED` and exits `14` before invoking DeepSeek. `--allow-large-context` bypasses. | Leave default for routine work; override only for a deliberate large-context refactor. |
+| **Context** | `--message-file <path>` | `turn`, `dispatch` | UTF-8 file containing the task message as an alternative to `--message`; avoids shell backtick/escaping mangling. | Use for long contracts or messages containing backticks/quotes/`$`. |
+| **Context** | `--map-tokens <N>` | `turn`, `dispatch` | Sets Aider `--map-tokens` repo-map budget (Tier 1/4: `0`; Tier 2: `0` when `--files` is explicit, `512` for Tier 3 or `--auto-scope`). | Keep `0` for isolated single-file edits; `512`+ only when cross-file symbol awareness is needed. |
+| **Cost Guard** | `--max-context-kb <N>` / `--allow-large-context` | `turn`, `dispatch` | Hard context-budget circuit breaker: deduplicates `--files` + `--read-files` on resolved paths and, if their total size exceeds `N` KB (default `128`), prints `[COST-GUARD]` + `[STATUS] PREFLIGHT_FAILED` and exits `14` before invoking DeepSeek. `--allow-large-context` bypasses. | Leave default for routine work; override only for a deliberate large-context refactor. |
 | **Cost Guard** | Dynamic `.aiderignore.ephemeral` data/large-file shield | `turn`, `dispatch`, `scope` | Ignores `docs/data/`, `data/`, `*.csv`, `*.parquet`, `*.json`, `uv.lock`, `package-lock.json`, `pnpm-lock.yaml`, `yarn.lock`, `web/catalog.json`, plus any unrequested file >100 KB; explicit `--files`/`--read-files` are re-exempted via sorted `!` negations placed after the wildcards. | Always active automatically; pass data/lockfile/JSON files explicitly when DeepSeek must edit them. |
 | **Caching** | `caches_by_default`, `examples_as_sys_msg` | Ephemeral YAML | Automatically written to `.aider.model.settings.<pid>.yml` for all DeepSeek models with `edit_format: diff` (`editor-diff` for editor). | Always active automatically for DeepSeek models to maximize server-side prefix cache hits. |
 | **Search** | `--count`, `--need-content`, `--json` | `search`, `dispatch` (Tier 4) | Configures DeepSeek search results (`1–50`, full page body, raw JSON output). | Research external APIs, PEPs, CVEs, or docs before coding (Tier 4 routes here automatically). |
