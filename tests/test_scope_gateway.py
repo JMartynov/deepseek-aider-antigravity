@@ -286,7 +286,19 @@ def test_create_ephemeral_aiderignore_default_no_json():
     with tempfile.TemporaryDirectory() as tmpdir:
         tmppath = Path(tmpdir)
         p = aider_bridge.create_ephemeral_aiderignore(tmppath)
-        assert "*.json" not in p.read_text()
+        text = p.read_text()
+        # JSON payloads are shielded by default (data-file shield).
+        assert "*.json" in text
+        assert not any(line.startswith("!") for line in text.splitlines())
+
+        # Explicitly requested JSON files are re-exempted after the wildcard.
+        (tmppath / "config.json").write_text("{}\n")
+        p2 = aider_bridge.create_ephemeral_aiderignore(
+            tmppath, explicit_files=["config.json"]
+        )
+        lines = p2.read_text().splitlines()
+        assert "!config.json" in lines
+        assert lines.index("!config.json") > lines.index("*.json")
 
 
 # ---------------------------------------------------------------------------

@@ -1392,3 +1392,150 @@ def test_run_turn_reflection_without_applied_edit_exits_11(monkeypatch, tmp_path
         (tmp_path / ".aider-sessions" / "refl_fail" / "state.json").read_text()
     )
     assert state["status"] == "FAILED"
+
+
+# ---------------------------------------------------------------------------
+# DeepSeek cost-saving guards (large-file shield, thinking default, budget)
+# ---------------------------------------------------------------------------
+
+def _write_kb_file(path: Path, kb: int):
+    """Create a file of exactly ``kb`` kibibytes."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"0" * (kb * 1024))
+
+
+def test_aiderignore_dynamic_large_file_exclusion_and_explicit_exemption(tmp_path):
+    (tmp_path / "small.py").write_text("x = 1\n")
+    _write_kb_file(tmp_path / "big.py", 150)
+    _write_kb_file(tmp_path / "explicit_big.py", 150)
+
+    p = aider_bridge.create_ephemeral_aiderignore(
+        tmp_path, explicit_files=["explicit_big.py"]
+    )
+    lines = p.read_text().splitlines()
+    assert "big.py" in lines
+    assert "explicit_big.py" not in lines
+    assert "small.py" not in lines
+
+
+def test_aiderignore_json_lockfile_and_data_dir_exemptions(tmp_path):
+    # Default case: bulk data dirs, lockfiles, and data payloads are shielded.
+    lines = aider_bridge.create_ephemeral_aiderignore(tmp_path).read_text().splitlines()
+    for pattern in ("*.json", "*.csv", "*.parquet", "data/", "docs/data/",
+                    "uv.lock", "package-lock.json", "pnpm-lock.yaml",
+                    "yarn.lock", "web/catalog.json"):
+        assert pattern in lines
+    assert not any(line.startswith("!") for line in lines)
+
+    # Explicit case: requested payloads are re-exempted after the wildcards.
+    (tmp_path / "data").mkdir()
+    (tmp_path / "data" / "keep.csv").write_text("a,b\n")
+    (tmp_path / "config.json").write_text("{}\n")
+    lines = aider_bridge.create_ephemeral_aiderignore(
+        tmp_path,
+        explicit_files=["config.json", "data/keep.csv", "web/catalog.json", "uv.lock"],
+    ).read_text().splitlines()
+    assert "!config.json" in lines
+    assert "!data/keep.csv" in lines
+    assert lines.index("!config.json") > lines.index("*.json")
+    assert lines.index("!data/keep.csv") > lines.index("*.json")
+    assert "web/catalog.json" not in lines
+    assert "uv.lock" not in lines
+    assert "data/" not in lines
+
+
+def test_run_turn_defaults_to_thinking_off(monkeypatch, tmp_path):
+    import inspect
+    assert inspect.signature(aider_bridge.run_turn).parameters["thinking"].default == "off"
+
+    _invoke_turn_and_capture(
+        monkeypatch, tmp_path,
+        ["--task-id", "think_off", "--message", "m", "--files", "foo.py"],
+    )
+    state = json.loads(
+        (tmp_path / ".aider-sessions" / "think_off" / "state.json").read_text()
+    )
+    assert state["thinking"] == "off"
+
+
+def test_turn_parser_thinking_default_is_off(monkeypatch):
+    captured = {}
+
+    def fake_run_turn(task_id, message, files, cwd, **kwargs):
+        captured.update(kwargs)
+
+    monkeypatch.setattr(aider_bridge, "run_turn", fake_run_turn)
+    monkeypatch.setattr(sys, "argv", [
+        "aider_bridge.py", "turn",
+        "--task-id", "think_cli",
+        "--message", "m",
+        "--cwd", ".",
+    ])
+    aider_bridge.main()
+    assert captured["thinking"] == "off"
+
+
+def test_context_budget_circuit_breaker_exits_14_before_subprocess(
+    monkeypatch, tmp_path, capsys
+):
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
+    monkeypatch.setattr(aider_bridge, "fetch_account_balance", lambda *a, **k: None)
+    _write_kb_file(tmp_path / "big.py", 300)
+
+    def fail_subproc(*a, **k):
+        raise AssertionError("subprocess.run must not be called once the budget trips")
+
+    monkeypatch.setattr(aider_bridge.subprocess, "run", fail_subproc)
+
+    with pytest.raises(SystemExit) as exc:
+        aider_bridge.run_turn("budget_trip", "m", ["big.py"], tmp_path)
+    assert exc.value.code == 14
+
+    captured = capsys.readouterr()
+    assert "[COST-GUARD]" in captured.err
+    assert "300.0 KB" in captured.err
+    assert "--max-context-kb (256 KB)" in captured.err
+    assert "Pass --allow-large-context to override." in captured.err
+    assert "[STATUS] PREFLIGHT_FAILED" in captured.out
+
+
+def test_context_budget_override_allows_execution(monkeypatch, tmp_path):
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
+    monkeypatch.setattr(aider_bridge, "fetch_account_balance", lambda *a, **k: None)
+    _write_kb_file(tmp_path / "big.py", 300)
+    captured = {}
+
+    def mock_run(cmd, cwd=None, capture_output=True, text=True, env=None):
+        if cmd and cmd[0] == "uvx":
+            captured["cmd"] = list(cmd)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(aider_bridge.subprocess, "run", mock_run)
+
+    with pytest.raises(SystemExit) as exc:
+        aider_bridge.run_turn(
+            "budget_ok", "m", ["big.py"], tmp_path, allow_large_context=True
+        )
+    assert exc.value.code == 0
+    assert "cmd" in captured
+
+
+def test_dispatch_forwards_context_budget_flags(monkeypatch):
+    captured = {}
+
+    def fake_run_turn(task_id, message, files, cwd, **kwargs):
+        captured.update(kwargs)
+
+    monkeypatch.setattr(aider_bridge, "run_turn", fake_run_turn)
+    monkeypatch.setattr(sys, "argv", [
+        "aider_bridge.py", "dispatch",
+        "--task-id", "d_budget",
+        "--message", "Implement verify_token",
+        "--files", "auth.py",
+        "--max-context-kb", "64",
+        "--allow-large-context",
+        "--cwd", ".",
+    ])
+    aider_bridge.main()
+    assert captured["max_context_kb"] == 64
+    assert captured["allow_large_context"] is True

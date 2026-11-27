@@ -21,6 +21,7 @@ import urllib.error
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import List, Optional
 from contextlib import contextmanager
 
 
@@ -428,7 +429,9 @@ def run_dispatch(task_id: str, message: str, files: list[str], cwd: Path,
                  verbose: bool = False, plan_align: bool = False,
                  restore: bool = False, count: int = 5,
                  need_content: bool = False, as_json: bool = False,
-                 auto_scope: bool = False):
+                 auto_scope: bool = False,
+                 max_context_kb: int = 256,
+                 allow_large_context: bool = False):
     """
     Classify a task into its optimal precision tier and dispatch it to the
     matching model/thinking/edit-format configuration (or DeepSeek search).
@@ -535,6 +538,8 @@ def run_dispatch(task_id: str, message: str, files: list[str], cwd: Path,
         map_tokens=resolved.get("map_tokens", 0),
         plan_align=effective_plan_align,
         tier=tier_name,
+        max_context_kb=max_context_kb,
+        allow_large_context=allow_large_context,
     )
 
 
@@ -980,9 +985,33 @@ def check_diff_applied_successfully(output: str):
     return True
 
 
-def create_ephemeral_aiderignore(cwd: Path, scope_mode: bool = False):
-    """Create an ephemeral .aiderignore shield covering secrets and cache artifacts."""
+def create_ephemeral_aiderignore(cwd: Path, scope_mode: bool = False,
+                                 explicit_files: Optional[List[str]] = None,
+                                 max_unrequested_kb: int = 100):
+    """
+    Create an ephemeral .aiderignore shield.
+
+    Covers secrets and cache artifacts, hides data/CSV/Parquet/JSON payloads and
+    lockfiles, and re-exempts explicitly requested files via sorted '!' negations.
+    A dynamic shield additionally hides unrequested files larger than
+    ``max_unrequested_kb`` KB to keep the prompt context (and cost) bounded.
+    """
     ignore_path = cwd / ".aiderignore.ephemeral"
+    cwd_resolved = Path(cwd).resolve()
+
+    # Normalize explicitly requested files to POSIX repo-relative paths.
+    explicit_set = set()
+    for ef in (explicit_files or []):
+        if not ef:
+            continue
+        raw = str(ef)
+        try:
+            rel = (cwd_resolved / raw).resolve().relative_to(cwd_resolved).as_posix()
+        except (ValueError, OSError):
+            rel = _clean_candidate_path(raw)
+        if rel:
+            explicit_set.add(rel)
+
     patterns = [
         ".env*",
         "*.pem",
@@ -1005,8 +1034,45 @@ def create_ephemeral_aiderignore(cwd: Path, scope_mode: bool = False):
         "passports/",
         "advisories/",
     ]
-    if scope_mode:
-        patterns.append("*.json")
+
+    # Withhold bulk data dirs only when no explicitly requested file lives there.
+    if not any(p == "docs/data" or p.startswith("docs/data/") for p in explicit_set):
+        patterns.append("docs/data/")
+    if not any(p == "data" or p.startswith("data/") for p in explicit_set):
+        patterns.append("data/")
+
+    for lock in ("uv.lock", "package-lock.json", "pnpm-lock.yaml",
+                 "yarn.lock", "web/catalog.json"):
+        if lock not in explicit_set:
+            patterns.append(lock)
+
+    patterns.extend(["*.csv", "*.parquet", "*.json"])
+
+    # Explicit exemptions must land after the wildcards that would swallow them.
+    negations = sorted(
+        f"!{rel}" for rel in explicit_set
+        if rel.lower().endswith((".csv", ".parquet", ".json"))
+    )
+    patterns.extend(negations)
+
+    # Dynamic large-file shield for unrequested payloads.
+    seen_dynamic = set()
+    walk_skip = {".git", ".venv", ".worktrees", "node_modules"}
+    for root, dirnames, filenames in os.walk(str(cwd_resolved)):
+        dirnames[:] = [d for d in dirnames if d not in walk_skip]
+        for fname in filenames:
+            fpath = Path(root) / fname
+            try:
+                if fpath.stat().st_size <= max_unrequested_kb * 1024:
+                    continue
+                rel = fpath.resolve().relative_to(cwd_resolved).as_posix()
+            except (OSError, ValueError):
+                continue
+            if rel in explicit_set or rel in seen_dynamic:
+                continue
+            seen_dynamic.add(rel)
+            patterns.append(rel)
+
     ignore_path.write_text("\n".join(patterns) + "\n")
     return ignore_path
 
@@ -1787,10 +1853,12 @@ def run_turn(task_id: str, message: str, files: list[str], cwd: Path,
              test_cmd: str = None, dry_run: bool = False,
              architect: bool = False, editor_model: str = None,
              worktree: bool = False, auto_merge: bool = True,
-             verbose: bool = False, thinking: str = "auto",
+             verbose: bool = False, thinking: str = "off",
              reasoning_effort: str = None, map_tokens: int = 0,
              plan_align: bool = False, session_root: Path = None,
-             tier: str = None, _is_suppress_retry: bool = False):
+             tier: str = None, max_context_kb: int = 256,
+             allow_large_context: bool = False,
+             _is_suppress_retry: bool = False):
     try:
         validate_task_id(task_id)
     except ValueError as e:
@@ -1835,12 +1903,46 @@ def run_turn(task_id: str, message: str, files: list[str], cwd: Path,
                      worktree=False, auto_merge=auto_merge, verbose=verbose,
                      thinking=thinking, reasoning_effort=reasoning_effort,
                      map_tokens=map_tokens, plan_align=plan_align,
-                     session_root=session_root, tier=tier)
+                     session_root=session_root, tier=tier,
+                     max_context_kb=max_context_kb,
+                     allow_large_context=allow_large_context)
         except SystemExit as e:
             code = e.code if isinstance(e.code, int) else (0 if e.code is None else 1)
             _handle_worktree_turn_exit(task_id, worktree_path, branch_name, cwd, auto_merge, code)
             raise
     run_preflight_checks(read_files, cwd)
+
+    # --- Hard Context Budget Circuit Breaker (COST-GUARD) ---
+    requested_paths = []
+    seen_requested = set()
+    for _f in (files or []) + (read_files or []):
+        if not _f:
+            continue
+        try:
+            _resolved_req = (cwd / _f).resolve()
+        except (OSError, RuntimeError):
+            continue
+        if _resolved_req in seen_requested:
+            continue
+        seen_requested.add(_resolved_req)
+        requested_paths.append(_resolved_req)
+
+    total_bytes = 0
+    for _rp in requested_paths:
+        try:
+            if _rp.is_file():
+                total_bytes += _rp.stat().st_size
+        except OSError:
+            continue
+    if total_bytes > max_context_kb * 1024 and not allow_large_context:
+        print(
+            f"[COST-GUARD] Total input context ({total_bytes / 1024:.1f} KB) exceeds "
+            f"--max-context-kb ({max_context_kb} KB). "
+            f"Pass --allow-large-context to override.",
+            file=sys.stderr,
+        )
+        print("[STATUS] PREFLIGHT_FAILED")
+        sys.exit(14)
 
     # --- Structured session directory management ---
     session_dir = get_session_dir(task_id, session_root)
@@ -1946,8 +2048,10 @@ def run_turn(task_id: str, message: str, files: list[str], cwd: Path,
         "--message", full_message
     ])
 
-    # Dynamic .aiderignore shield for secrets and cache artifacts
-    ignore_path = create_ephemeral_aiderignore(cwd)
+    # Dynamic .aiderignore shield for secrets, data payloads, and large files
+    ignore_path = create_ephemeral_aiderignore(
+        cwd, explicit_files=(files or []) + (read_files or [])
+    )
     cmd.extend(["--aiderignore", str(ignore_path)])
 
     # During Stage 1 planning (--chat-mode ask), suppress architect/editor & auto-lint/test
@@ -2093,6 +2197,8 @@ def run_turn(task_id: str, message: str, files: list[str], cwd: Path,
                     thinking=thinking, reasoning_effort=reasoning_effort,
                     map_tokens=map_tokens, plan_align=plan_align,
                     session_root=session_root, tier=tier,
+                    max_context_kb=max_context_kb,
+                    allow_large_context=allow_large_context,
                     _is_suppress_retry=True,
                 )
                 return
@@ -2296,7 +2402,7 @@ def reply_session(task_id: str, answer: str, cwd: Path,
             worktree=False,
             auto_merge=auto_merge,
             verbose=False,
-            thinking=state.get("thinking") or "auto",
+            thinking=state.get("thinking") or "off",
             reasoning_effort=state.get("reasoning_effort"),
             map_tokens=int(state.get("map_tokens", 0)),
             plan_align=False,
@@ -2329,11 +2435,15 @@ def main():
     turn_parser.add_argument("--worktree", action="store_true", help="Run the turn inside an isolated git worktree and branch")
     turn_parser.add_argument("--no-auto-merge", action="store_true", help="Do not auto-merge the worktree on turn completion")
     turn_parser.add_argument("-v", "--verbose", action="store_true", help="Include full thinking traces and raw startup banners in output")
-    turn_parser.add_argument("--thinking", default="auto", choices=["auto", "on", "off"], help="DeepSeek thinking mode (default: auto)")
+    turn_parser.add_argument("--thinking", default="off", choices=["auto", "on", "off"], help="DeepSeek thinking mode (default: off)")
     turn_parser.add_argument("--reasoning-effort", default=None, choices=["low", "high", "max"], help="DeepSeek reasoning effort level")
     turn_parser.add_argument("--map-tokens", type=int, default=0, help="Aider repo-map token budget (default: 0)")
     turn_parser.add_argument("--plan-align", action="store_true",
                              help="Stage 1 planning: propose architecture, do not edit files")
+    turn_parser.add_argument("--max-context-kb", type=int, default=256,
+                             help="Maximum total requested context size in KB before the cost guard trips (default: 256)")
+    turn_parser.add_argument("--allow-large-context", action="store_true",
+                             help="Allow requests whose total context exceeds --max-context-kb")
     turn_parser.add_argument("--cwd", default=".", help="Project working directory")
 
     dispatch_parser = subparsers.add_parser("dispatch", help="Auto-classify and dispatch a task to the optimal tier")
@@ -2363,6 +2473,10 @@ def main():
     dispatch_parser.add_argument("--count", type=int, default=5, help="Search result count when routed to Tier 4 research (1-50, default 5)")
     dispatch_parser.add_argument("--need-content", action="store_true", help="Include full page content when routed to Tier 4 research")
     dispatch_parser.add_argument("--json", action="store_true", help="Emit raw JSON response when routed to Tier 4 research")
+    dispatch_parser.add_argument("--max-context-kb", type=int, default=256,
+                                 help="Maximum total requested context size in KB before the cost guard trips (default: 256)")
+    dispatch_parser.add_argument("--allow-large-context", action="store_true",
+                                 help="Allow requests whose total context exceeds --max-context-kb")
     dispatch_parser.add_argument("--cwd", default=".", help="Project working directory")
     
     clean_parser = subparsers.add_parser("cleanup", help="Clean up session history file")
@@ -2419,7 +2533,9 @@ def main():
                  editor_model=args.editor_model, worktree=args.worktree,
                  auto_merge=not args.no_auto_merge, verbose=args.verbose,
                  thinking=args.thinking, reasoning_effort=args.reasoning_effort,
-                 map_tokens=args.map_tokens, plan_align=args.plan_align)
+                 map_tokens=args.map_tokens, plan_align=args.plan_align,
+                 max_context_kb=args.max_context_kb,
+                 allow_large_context=args.allow_large_context)
     elif args.command == "dispatch":
         run_dispatch(args.task_id, args.message, args.files, cwd_path,
                      read_files=args.read_files, test_cmd=args.test_cmd,
@@ -2432,7 +2548,9 @@ def main():
                      auto_merge=not args.no_auto_merge, verbose=args.verbose,
                      plan_align=args.plan_align, restore=args.restore,
                      count=args.count, need_content=args.need_content,
-                     as_json=args.json, auto_scope=args.auto_scope)
+                     as_json=args.json, auto_scope=args.auto_scope,
+                     max_context_kb=args.max_context_kb,
+                     allow_large_context=args.allow_large_context)
     elif args.command == "cleanup":
         cleanup_session(args.task_id, cwd_path)
     elif args.command == "inspect":
